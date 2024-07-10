@@ -1,3 +1,21 @@
+## What's this repo about:
+Here we try out the Grokfast algorithm on more setups that weren't covered in the original paper, such as different parameters, different filters, and its synergistic effects with different optimizers such as AdamW. 
+
+### Usage:
+There are many configs in the script test_main.py, modify the last few lines of that file to pick a config (a set of experiments), then run
+```python
+python test_main.py
+```
+### Support the work by running different experiments on a different task other than modular arithmetic, if you have enough computing power!
+
+Many aspects are still unknown such as:
+- How to find the best parameters for MA and EMA filters, given a specific task. 
+- Do other filters such as Kalman filters mitigate grokking as well?
+- AdamW with a large weight decay is known to reduce grokking, compare it with Grokfast.
+
+
+Below is the original readme file.
+
 <div align="center">
 
 <h1>Grokfast: Accelerated Grokking by</br>Amplifying Slow Gradients</h1>

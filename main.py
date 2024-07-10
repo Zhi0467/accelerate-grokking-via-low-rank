@@ -79,13 +79,21 @@ def multiplication_mod_p_data(p, eq_token, op_token):
 
     eq = torch.ones_like(x) * eq_token
     op = torch.ones_like(x) * op_token
-    result = x * y % p
+    result = (x * y ) % p
 
     # "All of our experiments used a small transformer trained on datasets of
     # equations of the form a◦b = c, where each of “a”, “◦”, “b”, “=”, and “c”
     # is a seperate token"
     return torch.stack([x, op, y, eq, result])
 
+def compute_sparsity(model):
+    total_params = 0
+    zero_params = 0
+    for param in model.parameters():
+        total_params += param.numel()
+        zero_params += (param == 0).sum().item()
+    sparsity = zero_params / total_params
+    return sparsity
 
 def main(args):
     torch.manual_seed(args.seed)
@@ -123,7 +131,7 @@ def main(args):
         betas=(args.beta1, args.beta2),
     )
 
-    #  linear learning rate warmup over the first 10 updates
+    #  linear learning rate warmup over the first 20 updates
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer, lambda update: 1 if update > 10 else update / 10
     )
@@ -136,6 +144,13 @@ def main(args):
 
     # For logging network weights.
     net_its, nets = [], []
+
+    initial_state = copy.deepcopy(model.state_dict())
+    init_vector = torch.cat([p.view(-1) for p in initial_state.values()])
+
+    param_norms_l2, param_distances_l2 = [], []
+    param_norms_l1, param_distances_l1 = [], []
+    sparsity_log = []
 
     for e in tqdm(range(int(args.budget) // steps_per_epoch)):
 
@@ -165,14 +180,24 @@ def main(args):
 
                     #######
 
-                    trigger = i < 500 if args.two_stage else False
+                    trigger = i < args.starting_point if args.two_stage else False
 
                     if args.filter == "none":
                         pass
                     elif args.filter == "ma":
                         grads = gradfilter_ma(model, grads=grads, window_size=args.window_size, lamb=args.lamb, trigger=trigger)
                     elif args.filter == "ema":
-                        grads = gradfilter_ema(model, grads=grads, alpha=args.alpha, lamb=args.lamb)
+                        grads = gradfilter_ema(model, grads=grads, alpha=args.alpha, lamb=args.lamb, trigger = trigger)
+                    elif args.filter == "smoother":
+                        grads = smoother(model, grads=grads, beta=args.beta, pp=args.pp)
+                    elif args.filter == "kalman":
+                        grads = gradfilter_kalman(
+                            model,
+                            grads=grads,
+                            process_noise=args.process_noise,
+                            measurement_noise=args.measurement_noise,
+                            lamb=args.lamb,
+                        )
                     else:
                         raise ValueError(f"Invalid gradient filter type `{args.filter}`")
 
@@ -193,8 +218,22 @@ def main(args):
                 val_acc.append(total_acc / valid_data.shape[-1])
                 val_loss.append(total_loss / valid_data.shape[-1])
 
+        with torch.no_grad():
+            param_vector = torch.cat([p.view(-1) for p in model.parameters()])
+            # init_vector = torch.cat([p.view(-1) for p in initial_state.values()])
+            l2_norm = torch.norm(param_vector, p=2).item()
+            l2_distance = torch.norm(param_vector - init_vector, p=2).item()
+            l1_norm = torch.norm(param_vector, p=1).item()
+            l1_distance = torch.norm(param_vector - init_vector, p=1).item()
+
+            param_norms_l2.append(l2_norm)
+            param_distances_l2.append(l2_distance)
+            param_norms_l1.append(l1_norm)
+            param_distances_l1.append(l1_distance)
+        sparsity = compute_sparsity(model)
+        sparsity_log.append(sparsity)
         if args.save_weights:
-            do_save = e <= 500 or (e > 500 and (e + 1) % 100 == 0) or e == int(args.budget) // steps_per_epoch - 1
+            do_save = e <= 100 or (e > 100 and (e + 1) % 100 == 0) or e == int(args.budget) // steps_per_epoch - 1
         else:
             do_save = (e + 1) % 100 == 0
         if do_save:
@@ -221,41 +260,96 @@ def main(args):
             plt.savefig(f"results/loss_{args.label}.png", dpi=150)
             plt.close()
 
-            results = {
-                'its': its,
-                'train_acc': train_acc,
-                'train_loss': train_loss,
-                'val_acc': val_acc,
-                'val_loss': val_loss,
-            }
+            plt.plot(steps, sparsity_log, label="sparsity")
+            plt.legend()
+            plt.title("Sparsity Over Training")
+            plt.xlabel("Optimization Steps")
+            plt.ylabel("Sparsity")
+            plt.grid()
+            plt.savefig(f"results/sparsity_{args.label}.png", dpi=150)
+            plt.close()
+
 
             if args.save_weights:
                 net_its.append(e)
-                nets.append(copy.deepcopy(model.state_dict()))
-                results['net_its'] = net_its
-                results['net'] = nets
+                nets.append(copy.deepcopy(model.state_dict()))           
 
-            torch.save(results, f"results/res_{args.label}.pt")
+    steps = torch.arange(len(param_norms_l1)).numpy() * steps_per_epoch
+    results = {
+        'its': its,
+        'train_acc': train_acc,
+        'train_loss': train_loss,
+        'val_acc': val_acc,
+        'val_loss': val_loss,
+        'param_norms_l1': param_norms_l1,
+        'param_distances_l1': param_distances_l1,
+        'param_norms_l2': param_norms_l2,
+        'param_distances_l2': param_distances_l2,
+        'steps_per_epoch': steps_per_epoch,
+    }
+
+    if args.save_weights:
+        results['net_its'] = net_its
+        results['net'] = nets
+
+    torch.save(results, f"results/res_{args.label}.pt")
+    # results['steps'] = steps
+    # torch.save(results, f"results/res_{args.label}.pt")
+    # Plotting L2 norms and distances
+    plt.figure()
+    plt.plot(steps, param_norms_l2, label="L2 Norm")
+    plt.plot(steps, param_distances_l2, label="L2 Distance from Initial")
+    plt.xlabel("Optimization Steps")
+    plt.ylabel("L2 Norm")
+    plt.xscale("log", base=10)
+    plt.yscale("log", base=10)
+    plt.legend()
+    plt.title("L2 Norm and Distance")
+    plt.legend()
+    plt.savefig(f"results/norms_distances_l2_{args.label}.png")
+    plt.close()
+
+    # Plotting L1 norms and distances
+    plt.figure()
+    plt.plot(steps, param_norms_l1, label="L1 Norm")
+    plt.plot(steps, param_distances_l1, label="L1 Distance from Initial")
+    plt.xlabel("Optimization Steps")
+    plt.ylabel("L1 Norm")
+    plt.xscale("log", base=10)
+    plt.yscale("log", base=10)
+    plt.legend()
+    plt.title("L1 Norm and Distance")
+    plt.legend()
+    plt.savefig(f"results/norms_distances_l1_{args.label}.png")
+    plt.close()
+        
 
 
 if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("--label", default="")
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seed", type=int, default= 0)
     parser.add_argument("--p", type=int, default=97)
-    parser.add_argument("--budget", type=int, default=3e5)
-    parser.add_argument("--batch_size", type=int, default=512)
+    parser.add_argument("--budget", type=int, default= 150000)
+    parser.add_argument("--batch_size", type=int, default= 512)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--beta1", type=float, default=0.9)
     parser.add_argument("--beta2", type=float, default=0.98)
     parser.add_argument("--weight_decay", type=float, default=0)
     parser.add_argument("--optimizer", default="Adam")
+    parser.add_argument("--starting_point", type=int, default= 1)
 
     # Grokfast
-    parser.add_argument("--filter", type=str, choices=["none", "ma", "ema", "fir"], default="none")
+    parser.add_argument("--filter", type=str, choices=["none", "ma", "ema", "fir", "smoother", "kalman"], default="none")
     parser.add_argument("--alpha", type=float, default=0.99)
     parser.add_argument("--window_size", type=int, default=100)
     parser.add_argument("--lamb", type=float, default=5.0)
+    parser.add_argument("--process_noise", type=float, default=1e-4)
+    parser.add_argument("--measurement_noise", type=float, default=1e-2)
+
+    # Smoother
+    parser.add_argument("--beta", type=float, default=0.98)
+    parser.add_argument("--pp", type=float, default=0.01)
 
     # Ablation studies
     parser.add_argument("--two_stage", action='store_true')
@@ -266,6 +360,9 @@ if __name__ == "__main__":
     window_size_str = f'_w{args.window_size}'
     alpha_str = f'_a{args.alpha:.3f}'.replace('.', '')
     lamb_str = f'_l{int(args.lamb)}'
+    optimizer_str = f'_optimizer{args.optimizer}'
+    beta_str = f'_beta{args.beta}'
+    pp_str = f'_pp{args.pp}'
 
     if args.filter == 'none':
         filter_suffix = ''
@@ -273,6 +370,13 @@ if __name__ == "__main__":
         filter_suffix = window_size_str + lamb_str
     elif args.filter == 'ema':
         filter_suffix = alpha_str + lamb_str
+    elif args.filter == 'smoother':
+        filter_suffix = beta_str + pp_str
+    elif args.filter == "kalman":
+        filter_suffix = (
+            f"_p{args.process_noise:.1e}_m{args.measurement_noise:.1e}".replace(".", "")
+            + lamb_str
+        )
     else:
         raise ValueError(f"Unrecognized filter type {args.filter}")
 
@@ -282,7 +386,10 @@ if __name__ == "__main__":
     if args.lr != 1e-3:
         optim_suffix = optim_suffix + f'_lrx{int(args.lr / 1e-3)}'
 
-    args.label = args.label + filter_str + filter_suffix + optim_suffix
+    two_stage_suffix = '_two_stage' if args.two_stage else ''
+    starting_point_suffix = f'_start_at{int(args.starting_point)}'
+
+    args.label = args.label + filter_str + filter_suffix + optim_suffix +  optimizer_str + two_stage_suffix + starting_point_suffix
     print(f'Experiment results saved under name: {args.label}')
 
     main(args)

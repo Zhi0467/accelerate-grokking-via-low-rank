@@ -79,8 +79,7 @@ loss_function_dict = {
     'CrossEntropy': nn.CrossEntropyLoss
 }
 
-
-def main(args):
+def train_model(args, initialization_scale):
     log_freq = math.ceil(args.optimization_steps / 150)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -117,7 +116,7 @@ def main(args):
     mlp = nn.Sequential(*layers).to(device)
     with torch.no_grad():
         for p in mlp.parameters():
-            p.data = args.initialization_scale * p.data
+            p.data = initialization_scale * p.data
     nparams = sum([p.numel() for p in mlp.parameters() if p.requires_grad])
     print(f'Number of parameters: {nparams}')
 
@@ -129,13 +128,12 @@ def main(args):
     assert args.loss_function in loss_function_dict
     loss_fn = loss_function_dict[args.loss_function]()
 
-
     train_losses, test_losses, train_accuracies, test_accuracies = [], [], [], []
-    norms, last_layer_norms, log_steps = [], [], []
-    grads = None
+    log_steps = []
 
     steps = 0
     one_hots = torch.eye(10, 10).to(device)
+    grads = None
     with tqdm(total=args.optimization_steps, dynamic_ncols=True) as pbar:
         for x, labels in islice(cycle(train_loader), args.optimization_steps):
             do_log = (steps < 30) or (steps < 150 and steps % 10 == 0) or steps % log_freq == 0
@@ -163,69 +161,78 @@ def main(args):
 
             optimizer.zero_grad()
             loss.backward()
-
-            #######
-
-            trigger = False
-
             if args.filter == "none":
-                pass
+              pass
             elif args.filter == "ma":
-                grads = gradfilter_ma(mlp, grads=grads, window_size=args.window_size, lamb=args.lamb, trigger=trigger)
+              grads = gradfilter_ma(mlp, grads=grads, window_size=args.window_size,lamb=args.lamb, trigger=trigger)
             elif args.filter == "ema":
-                grads = gradfilter_ema(mlp, grads=grads, alpha=args.alpha, lamb=args.lamb)
+              grads = gradfilter_ema(mlp, grads=grads, alpha=args.alpha, lamb=args.lamb)
             else:
-                raise ValueError(f"Invalid gradient filter type `{args.filter}`")
-
-            #######
-
+              raise ValueError(f"Invalid gradient filter type `{args.filter}`")
             optimizer.step()
 
             steps += 1
             pbar.update(1)
 
-            if do_log:
-                title = (f"MNIST Image Classification")
+    return log_steps, train_accuracies, test_accuracies, train_losses, test_losses
 
-                plt.plot(log_steps, train_accuracies, label="train")
-                plt.plot(log_steps, test_accuracies, label="val")
-                plt.legend()
-                plt.title(title)
-                plt.xlabel("Optimization Steps")
-                plt.ylabel("Accuracy")
-                plt.xscale("log", base=10)
-                plt.grid()
-                plt.savefig(f"results/mnist_acc_{args.label}.png", dpi=150)
-                plt.close()
 
-                plt.plot(log_steps, train_losses, label="train")
-                plt.plot(log_steps, test_losses, label="val")
-                plt.legend()
-                plt.title(title)
-                plt.xlabel("Optimization Steps")
-                plt.ylabel(f"{args.loss_function} Loss")
-                plt.xscale("log", base=10)
-                plt.yscale("log", base=10)
-                plt.grid()
-                plt.savefig(f"results/mnist_loss_{args.label}.png", dpi=150)
-                plt.close()
+def main(args):
+    scales = args.scales
+    results = []
 
-                torch.save({
-                    'its': log_steps,
-                    'train_acc': train_accuracies,
-                    'train_loss': train_losses,
-                    'val_acc': test_accuracies,
-                    'val_loss': test_losses,
-                }, f"results/mnist_{args.label}.pt")
+    for scale in scales:
+        log_steps, train_accuracies, test_accuracies, train_losses, test_losses = train_model(args, scale)
+        results.append({
+            'scale': scale,
+            'log_steps': log_steps,
+            'train_accuracies': train_accuracies,
+            'test_accuracies': test_accuracies,
+            'train_losses': train_losses,
+            'test_losses': test_losses,
+        })
 
+    # Plot accuracies
+    plt.figure(figsize=(10, 5))
+    for result in results:
+        scale = result['scale']
+        plt.plot(result['log_steps'], result['train_accuracies'], label = "Train (scale= {:.1f})".format(scale))
+        plt.plot(result['log_steps'], result['test_accuracies'], label = "Test (scale= {:.1f})".format(scale))
+    plt.legend()
+    plt.title("MNIST Image Classification Accuracy")
+    plt.xlabel("Optimization Steps")
+    plt.ylabel("Accuracy")
+    plt.xscale("log", base=10)
+    plt.grid()
+    plt.savefig("mnist_acc_combined.png", dpi=150)
+    plt.close()
+
+    # Plot losses
+    plt.figure(figsize=(10, 5))
+    for result in results:
+        scale = result['scale']
+        plt.plot(result['log_steps'], result['train_losses'], label = "Train (scale= {:.1f})".format(scale))
+        plt.plot(result['log_steps'], result['test_losses'], label = "Test (scale= {:.1f})".format(scale))
+    plt.legend()
+    plt.title("MNIST Image Classification Loss")
+    plt.xlabel("Optimization Steps")
+    plt.ylabel(f"{args.loss_function} Loss")
+    plt.xscale("log", base=10)
+    plt.yscale("log", base=10)
+    plt.grid()
+    plt.savefig("mnist_loss_combined.png", dpi=150)
+    plt.close()
+    
 
 if __name__ == '__main__':
     parser = ArgumentParser()
     parser.add_argument("--label", default="")
+    parser.add_argument("--scales", nargs='+', type=float, default=[8.0, 16.0], help="List of scales")
     parser.add_argument("--seed", type=int, default=0)
 
+
     parser.add_argument("--train_points", type=int, default=1000)
-    parser.add_argument("--optimization_steps", type=int, default=100000)
+    parser.add_argument("--optimization_steps", type=int, default=2)
     parser.add_argument("--batch_size", type=int, default=200)
     parser.add_argument("--loss_function", type=str, default="MSE")
     parser.add_argument("--optimizer", type=str, default="AdamW")
@@ -243,28 +250,5 @@ if __name__ == '__main__':
     parser.add_argument("--window_size", type=int, default=100)
     parser.add_argument("--lamb", type=float, default=5.0)
     args = parser.parse_args()
-
-    filter_str = ('_' if args.label != '' else '') + args.filter
-    window_size_str = f'_w{args.window_size}'
-    alpha_str = f'_a{args.alpha:.3f}'.replace('.', '')
-    lamb_str = f'_l{args.lamb:.2f}'.replace('.', '')
-
-    if args.filter == 'none':
-        filter_suffix = ''
-    elif args.filter == 'ma':
-        filter_suffix = window_size_str + lamb_str
-    elif args.filter == 'ema':
-        filter_suffix = alpha_str + lamb_str
-    else:
-        raise ValueError(f"Unrecognized filter type {args.filter}")
-
-    optim_suffix = ''
-    if args.weight_decay != 0:
-        optim_suffix = optim_suffix + f'_wd{args.weight_decay:.1e}'.replace('.', '')
-    if args.lr != 1e-3:
-        optim_suffix = optim_suffix + f'_lrx{int(args.lr / 1e-3)}'
-
-    args.label = args.label + filter_str + filter_suffix + optim_suffix
-    print(f'Experiment results saved under name: {args.label}')
 
     main(args)
