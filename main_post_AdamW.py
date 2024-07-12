@@ -12,6 +12,39 @@ import torch.nn.functional as F
 
 from grokfast import *
 
+class AdamWOptim():
+    def __init__(self, model, lr=0.01, beta1=0.9, beta2=0.999, epsilon=1e-8, weight_decay=0.01):
+        self.model = model
+        self.lr = lr
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.epsilon = epsilon
+        self.weight_decay = weight_decay
+        self.m = {n: torch.zeros_like(p) for n, p in model.named_parameters() if p.requires_grad}
+        self.v = {n: torch.zeros_like(p) for n, p in model.named_parameters() if p.requires_grad}
+
+    def update(self, t):
+        for n, p in self.model.named_parameters():
+            if p.requires_grad and p.grad is not None:
+                grad = p.grad.data.detach()
+
+                # Momentum beta 1
+                self.m[n] = self.beta1 * self.m[n] + (1 - self.beta1) * grad
+
+                # RMS beta 2
+                self.v[n] = self.beta2 * self.v[n] + (1 - self.beta2) * (grad ** 2)
+
+                # Bias correction
+                m_corr = self.m[n] / (1 - self.beta1 ** t)
+                v_corr = self.v[n] / (1 - self.beta2 ** t)
+
+                # Compute the update
+                update = self.lr * (m_corr / (torch.sqrt(v_corr) + self.epsilon))
+                update += self.weight_decay * self.lr * p.data.detach()
+
+                # Update the gradient in place
+                p.grad.data = update
+
 
 class Block(nn.Module):
     """Causal transformer block
@@ -79,7 +112,7 @@ def multiplication_mod_p_data(p, eq_token, op_token):
 
     eq = torch.ones_like(x) * eq_token
     op = torch.ones_like(x) * op_token
-    result = (x * y ) % p
+    result = (x**2 + x * y + y**2 ) % p
 
     # "All of our experiments used a small transformer trained on datasets of
     # equations of the form a◦b = c, where each of “a”, “◦”, “b”, “=”, and “c”
@@ -124,16 +157,22 @@ def main(args):
 
     # For most experiments we used AdamW optimizer with learning rate 10−3,
     # weight decay 1, β1 = 0.9, β2 = 0.98
-    optimizer = getattr(torch.optim, args.optimizer)(
+    
+    # this torch_optimizer is just an SGD with lr 1
+    # so it only adds the update without any internal manipulation.
+    torch_optimizer = getattr(torch.optim, "SGD")(
         model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        betas=(args.beta1, args.beta2),
+        lr=1.0,
+    )
+  
+
+    optimizer = AdamWOptim(
+      model = model, lr = args.lr, beta1 = args.beta1, beta2 = args.beta2, epsilon=1e-8, weight_decay = args.weight_decay
     )
 
-    #  linear learning rate warmup over the first 20 updates
+    #  linear learning rate warmup over the first 10 updates
     scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, lambda update: 1 if update > 10 else update / 10
+        torch_optimizer, lambda update: 1 if update > 10 else update / 10
     )
 
     steps_per_epoch = math.ceil(train_data.shape[1] / args.batch_size)
@@ -178,32 +217,53 @@ def main(args):
                     model.zero_grad()
                     loss.backward()
 
-                    #######
-
                     trigger = i < args.starting_point if args.two_stage else False
 
+                    # Update gradients using AdamW
+                    optimizer.update(i + 1)
+
+                    # Apply filters to modified gradients
+                    grads = {n: p.grad.data.detach() for n, p in model.named_parameters() if p.requires_grad and p.grad is not None}
                     if args.filter == "none":
                         pass
                     elif args.filter == "ma":
                         grads = gradfilter_ma(model, grads=grads, window_size=args.window_size, lamb=args.lamb, trigger=trigger)
                     elif args.filter == "ema":
-                        grads = gradfilter_ema(model, grads=grads, alpha=args.alpha, lamb=args.lamb, trigger = trigger)
+                        grads = gradfilter_ema(model, grads=grads, alpha=args.alpha, lamb=args.lamb, trigger=trigger)
                     elif args.filter == "smoother":
                         grads = smoother(model, grads=grads, beta=args.beta, pp=args.pp)
                     elif args.filter == "kalman":
-                        grads = gradfilter_kalman(
-                            model,
-                            grads=grads,
-                            process_noise=args.process_noise,
-                            measurement_noise=args.measurement_noise,
-                            lamb=args.lamb,
-                        )
+                        grads = gradfilter_kalman(model, grads=grads, process_noise=args.process_noise, measurement_noise=args.measurement_noise, lamb=args.lamb)
                     else:
-                        raise ValueError(f"Invalid gradient filter type `{args.filter}`")
+                        raise ValueError(f"Invalid update filter type `{args.filter}`")
 
-                    #######
+                    """
+                    # Apply the modified gradients to the parameters
+                    
+                    for n, p in model.named_parameters():
+                        if p.requires_grad and p.grad is not None:
+                            p.data.add_(-grads[n])
+                   
+                    # Check if gradients are zero
+                    zero_gradients = True
+                    for name, param in model.named_parameters():
+                        if param.requires_grad and param.grad is not None:
+                            if not torch.all(param.grad == 0):
+                                zero_gradients = False
+                                break
 
-                    optimizer.step()
+                    if zero_gradients:
+                        print("All gradients are zero")
+                    else:
+                        print("Non-zero gradients found")
+                    """
+
+                    torch_optimizer.step()
+                    torch_optimizer.zero_grad()
+                    # Zero gradients after update
+                    
+
+
                     scheduler.step()
                     i += 1
 
@@ -214,9 +274,13 @@ def main(args):
                 train_acc.append(total_acc / train_data.shape[-1])
                 train_loss.append(total_loss / train_data.shape[-1])
                 its.append(i)
+                print(f"\n Training: Epoch {e}, Iteration {i}, Loss: {total_loss / train_data.shape[-1]}, Accuracy: {total_acc / train_data.shape[-1]}")
             else:
                 val_acc.append(total_acc / valid_data.shape[-1])
                 val_loss.append(total_loss / valid_data.shape[-1])
+                print(f"\n Test: Epoch {e}, Iteration {i}, Loss: {total_loss / valid_data.shape[-1]}, Accuracy: {total_acc / valid_data.shape[-1]} \n")
+
+            
 
         with torch.no_grad():
             param_vector = torch.cat([p.view(-1) for p in model.parameters()])
@@ -235,8 +299,10 @@ def main(args):
         if args.save_weights:
             do_save = e <= 100 or (e > 100 and (e + 1) % 100 == 0) or e == int(args.budget) // steps_per_epoch - 1
         else:
-            do_save = (e + 1) % 100 == 0
+            do_save = (e + 1) % 1 == 0
         if do_save:
+            # print(f"training acc: {train_acc}\n")
+            # print(f"test acc: {train_acc}\n")
             steps = torch.arange(len(train_acc)).numpy() * steps_per_epoch
             plt.plot(steps, train_acc, label="train")
             plt.plot(steps, val_acc, label="val")
@@ -246,8 +312,9 @@ def main(args):
             plt.ylabel("Accuracy")
             plt.xscale("log", base=10)
             plt.grid()
-            plt.savefig(f"results/acc_{args.label}.png", dpi=150)
+            plt.savefig(f"results_post_AdamW/acc_{args.label}.png", dpi=150)
             plt.close()
+            
 
             plt.plot(steps, train_loss, label="train")
             plt.plot(steps, val_loss, label="val")
@@ -257,9 +324,10 @@ def main(args):
             plt.ylabel("Loss")
             plt.xscale("log", base=10)
             plt.grid()
-            plt.savefig(f"results/loss_{args.label}.png", dpi=150)
+            plt.savefig(f"results_post_AdamW/loss_{args.label}.png", dpi=150)
             plt.close()
 
+            """
             plt.plot(steps, sparsity_log, label="sparsity")
             plt.legend()
             plt.title("Sparsity Over Training")
@@ -268,7 +336,7 @@ def main(args):
             plt.grid()
             plt.savefig(f"results/sparsity_{args.label}.png", dpi=150)
             plt.close()
-
+            """
 
             if args.save_weights:
                 net_its.append(e)
@@ -292,7 +360,7 @@ def main(args):
         results['net_its'] = net_its
         results['net'] = nets
 
-    torch.save(results, f"results/res_{args.label}.pt")
+    torch.save(results, f"results_post_AdamW/res_{args.label}.pt")
     # results['steps'] = steps
     # torch.save(results, f"results/res_{args.label}.pt")
     # Plotting L2 norms and distances
@@ -306,7 +374,7 @@ def main(args):
     plt.legend()
     plt.title("L2 Norm and Distance")
     plt.legend()
-    plt.savefig(f"results/norms_distances_l2_{args.label}.png")
+    plt.savefig(f"results_post_AdamW/norms_distances_l2_{args.label}.png")
     plt.close()
 
     # Plotting L1 norms and distances
@@ -320,7 +388,7 @@ def main(args):
     plt.legend()
     plt.title("L1 Norm and Distance")
     plt.legend()
-    plt.savefig(f"results/norms_distances_l1_{args.label}.png")
+    plt.savefig(f"results_post_AdamW/norms_distances_l1_{args.label}.png")
     plt.close()
         
 
