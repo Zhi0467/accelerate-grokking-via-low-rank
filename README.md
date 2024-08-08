@@ -1,11 +1,18 @@
 ## What's this repo about:
-Here we try out the Grokfast algorithm on more setups that weren't covered in the original paper, such as different parameters, different filters, and its synergistic effects with different optimizers such as AdamW. 
+Here we:
+1. try out the Grokfast algorithm on more setups that weren't covered in the original paper, such as different parameters, different filters, and its synergistic effects with different optimizers such as AdamW. 
+2. experiments for faster kernel-escaping algorithms.
 
 ### Usage:
-There are many configs in the script test_main.py, modify the last few lines of that file to pick a config (a set of experiments), then run
+There are many configs in the scripts that start with "test", modify the last few lines of that file to pick a config (a set of experiments) or add new configs/expriments, then run (e.g.)
 ```python
-python test_main.py
+python test_mlp.py
 ```
+or 
+```python
+python test_mlp_LoRA.py
+```
+
 ### Support the work by running different experiments on a different task other than modular arithmetic, if you have enough computing power!
 
 Many aspects are still unknown such as:

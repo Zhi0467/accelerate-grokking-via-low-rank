@@ -13,10 +13,8 @@ import torch.nn.functional as F
 
 from grokfast import *
 from model import *
-from model import compute_jacobian
 from optimizers import *
-from arg_parser import *
-
+from arg_parser import Arg_parser
 
 def compute_sparsity(model):
     total_params = 0
@@ -53,7 +51,6 @@ def extract_weight_matrices(layer):
         'ffn2': ffn_weight_2,
     }
 
-
 def compute_norm_shannon_entropy(weight_matrix):
     abs_weights = torch.abs(weight_matrix)
     l1_norm = torch.sum(abs_weights)
@@ -62,13 +59,11 @@ def compute_norm_shannon_entropy(weight_matrix):
     entropy = -torch.sum(abs_weights * log_abs_weights).item()
     return entropy
 
+
 def main(args):
-    
     torch.manual_seed(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    _ = torch.randn(1, device=device)
-
 
     # tokens for <op> and <=>. It's not clear why <=> is needed at all since it
     # has no effect on the output, but we'll leave it in to best follow the
@@ -82,7 +77,7 @@ def main(args):
     # transformer with 2 layers, width 128, and 4 attention heads"
     num_layers = 2
     model = Decoder(
-        dim=128, num_layers = num_layers, num_heads=4, num_tokens=args.p + 2, seq_len=5, rank = args.init_rank
+        dim=128, num_layers = num_layers, num_heads=4, num_tokens=args.p + 2, seq_len=5
     ).to(device)
     nparams = sum([p.numel() for p in model.parameters() if p.requires_grad])
     print(model)
@@ -108,6 +103,8 @@ def main(args):
       model = model, lr = args.lr, beta1 = args.beta1, beta2 = args.beta2, epsilon=1e-8, weight_decay = args.weight_decay
     )
 
+    lookahead_optimizer = LookaheadOptim(model= model, inner_optimizer= optimizer)
+
     scheduler = LrScheduler(large_lr=args.large_lr, regular_lr=args.lr, warmup_steps = 20, cutoff_steps=args.cutoff_steps)
 
 
@@ -116,7 +113,7 @@ def main(args):
     lambda_rank_scheduler = LambdaWarmUpScheduler(initial_value=0, final_value=args.lambda_rank, warmup_steps=10)
 
     # the layer to plot the normalized effective ranks
-    layer_inspected = 2
+    layer_inspected = num_layers
     layer = model.layers[layer_inspected - 1] 
 
     layer_weights = extract_weight_matrices(layer)
@@ -148,12 +145,9 @@ def main(args):
     count = 0
     grads_similarity_log = [None for _ in range(len(cos_sim_interval))]
     current_grad_vector = [None for _ in range(len(cos_sim_interval))]
-    
     for interval in cos_sim_interval:
         grads_similarity_log[count] = []
         count = count + 1
-
-    # jacobian_norms = []
 
     for e in tqdm(range(int(args.budget) // steps_per_epoch)):
 
@@ -165,7 +159,6 @@ def main(args):
             model.train(is_train)
             total_loss = 0
             total_acc = 0
-            total_jacobian_norm_change = 0
 
             # torch.split faster than dataloader with tensor
             dl = torch.split(data, args.batch_size, dim=1)
@@ -197,13 +190,6 @@ def main(args):
                     total_loss += loss.item() * input.shape[-1]
 
                 if is_train:
-                    # compute the jacobian 
-                    """
-                    jacobian_start = compute_jacobian(model, device, input[:-1])
-                    print("Jacobian tensor device:", jacobian_start.device)
-                    norm = torch.norm(jacobian_start)
-                    print(f'Epoch {e+1}, Norm of Jacobian: {norm.item()}')
-                    """
                     model.zero_grad()
                     loss.backward()
                     
@@ -216,6 +202,11 @@ def main(args):
 
 
                     trigger = i < args.starting_point if args.two_stage else False
+
+                    # Update gradients using AdamW
+                    optimizer.lr = scheduler.step()
+                    lookahead_optimizer.update(i + 1)
+
                     # Apply filters to modified gradients
                     # grads = {n: p.grad.data.detach() for n, p in model.named_parameters() if p.requires_grad and p.grad is not None}
                     if args.filter == "none":
@@ -235,12 +226,6 @@ def main(args):
                     else:
                         raise ValueError(f"Invalid update filter type `{args.filter}`")
 
-
-                    # Update gradients using AdamW
-                    optimizer.lr = scheduler.step()
-                    optimizer.update(i + 1)
-
-                
                     """
                     # Apply the modified gradients to the parameters
                     
@@ -277,27 +262,17 @@ def main(args):
 
                     torch_optimizer.step()
                     torch_optimizer.zero_grad()
-                    # compute the jacobian 
-                    """
-                    jacobian_end = compute_jacobian(model, device, input[:-1])
-                    jacobian_change = torch.norm(jacobian_end - jacobian_start) 
-                    jacobian_norm = jacobian_change / torch.norm(jacobian_start)
-                    total_jacobian_norm_change += jacobian_norm.item() * input.shape[-1]
-                    """
                     # Zero gradients after update
                     i += 1
 
                 acc = (logits[-1].argmax(-1) == input[-1]).float().mean()
                 total_acc += acc.item() * input.shape[-1]
-                
 
             if is_train:
-                # jacobian_norms.append(total_jacobian_norm_change / train_data.shape[-1])
                 train_acc.append(total_acc / train_data.shape[-1])
                 train_loss.append(total_loss / train_data.shape[-1])
                 its.append(i)
                 # print(f"\n Training: Epoch {e}, Iteration {i}, Loss: {total_loss / train_data.shape[-1]}, Accuracy: {total_acc / train_data.shape[-1]}")
-                # print(f'Epoch {e+1}, Norm of Jacobian Change: {jacobian_norm.item()}')
             else:
                 val_acc.append(total_acc / valid_data.shape[-1])
                 val_loss.append(total_loss / valid_data.shape[-1])
@@ -325,7 +300,6 @@ def main(args):
         for name, weight_matrix in layer_weights.items():
             layer_matrix_ranks[name].append(compute_norm_effective_rank(weight_matrix))
             layer_matrix_entropy[name].append(compute_norm_shannon_entropy(weight_matrix))
-        
 
         if args.save_weights:
             do_save = e <= 100 or (e > 100 and (e + 1) % 100 == 0) or e == int(args.budget) // steps_per_epoch - 1
@@ -344,7 +318,7 @@ def main(args):
             plt.ylabel("Accuracy")
             plt.xscale("log", base=10)
             plt.grid()
-            plt.savefig(f"results_post_AdamW/acc_{args.label}.png", dpi=150)
+            plt.savefig(f"results_lookahead/acc_{args.label}.png", dpi=150)
             plt.close()
             
 
@@ -356,7 +330,7 @@ def main(args):
             plt.ylabel("Loss")
             plt.xscale("log", base=10)
             plt.grid()
-            plt.savefig(f"results_post_AdamW/loss_{args.label}.png", dpi=150)
+            plt.savefig(f"results_lookahead/loss_{args.label}.png", dpi=150)
             plt.close()
 
             # plot grads changes
@@ -368,11 +342,11 @@ def main(args):
                 plt.xscale("log", base=10)
                 plt.title(f'Update Cos Similarity, Every {interval} Steps')
                 plt.grid(True)
-                plt.savefig(f"results_post_AdamW/grads_similarity_interval_{interval}_{args.label}.png", dpi=150)
+                plt.savefig(f"results_lookahead/grads_similarity_interval_{interval}_{args.label}.png", dpi=150)
                 plt.close()
                 count = count + 1
 
-            
+
             for name, value in layer_matrix_ranks.items():
                 plt.plot(steps, value, label=f"matrix_{name}")
             plt.legend()
@@ -381,7 +355,7 @@ def main(args):
             plt.ylabel("normalized ranks")
             plt.xscale("log", base=10)
             plt.grid()
-            plt.savefig(f"results_post_AdamW/layer_{layer_inspected}_ranks_{args.label}.png", dpi=150)
+            plt.savefig(f"results_lookahead/layer_{layer_inspected}_ranks_{args.label}.png", dpi=150)
             plt.close()
 
             for name, value in layer_matrix_entropy.items():
@@ -392,9 +366,9 @@ def main(args):
             plt.ylabel("entropy")
             plt.xscale("log", base=10)
             plt.grid()
-            plt.savefig(f"results_post_AdamW/layer_{layer_inspected}_entropy_{args.label}.png", dpi=150)
+            plt.savefig(f"results_lookahead/layer_{layer_inspected}_entropy_{args.label}.png", dpi=150)
             plt.close()
-            
+
 
             """
             plt.plot(steps, sparsity_log, label="sparsity")
@@ -443,7 +417,7 @@ def main(args):
     plt.legend()
     plt.title("L2 Norm and Distance")
     plt.legend()
-    plt.savefig(f"results_post_AdamW/norms_distances_l2_{args.label}.png")
+    plt.savefig(f"results_lookahead/norms_distances_l2_{args.label}.png")
     plt.close()
 
     # Plotting L1 norms and distances
@@ -457,7 +431,7 @@ def main(args):
     plt.legend()
     plt.title("L1 Norm and Distance")
     plt.legend()
-    plt.savefig(f"results_post_AdamW/norms_distances_l1_{args.label}.png")
+    plt.savefig(f"results_lookahead/norms_distances_l1_{args.label}.png")
     plt.close()
         
 
