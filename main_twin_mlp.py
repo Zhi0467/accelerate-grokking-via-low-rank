@@ -3,9 +3,6 @@ twin training on two SimpleMLP
 with different scales
 """
 
-# modular arithmetic in a 2-layer MLP
-# = high dimensional sparse classification 
-
 from re import L
 import numpy as np
 import torch
@@ -34,7 +31,35 @@ def compute_norm_effective_rank(weight_matrix):
     rank = torch.linalg.matrix_rank(weight_matrix)
     effective_rank = effective_rank / rank
     return effective_rank.item()
+
+def compute_cosine_similarity(matrix1, matrix2):
+    # Flatten the matrices into vectors
+    vec1 = matrix1.view(-1)
+    vec2 = matrix2.view(-1)
     
+    # Compute the dot product of the two vectors
+    dot_product = torch.dot(vec1, vec2)
+    
+    # Compute the magnitude (Euclidean norm) of each vector
+    magnitude_vec1 = torch.norm(vec1)
+    magnitude_vec2 = torch.norm(vec2)
+    
+    # Compute the cosine similarity
+    cosine_sim = dot_product / (magnitude_vec1 * magnitude_vec2)
+    
+    return cosine_sim.item()  # Convert to a Python float for readability
+
+def low_rank_approximation(matrix, rank):
+    # Perform SVD on the attention weights matrix
+    U, S, V = torch.svd(matrix)
+    # Retain only the top 'rank' singular values
+    S = torch.diag(S[:rank])
+    U = U[:, :rank]
+    V = V[:, :rank]
+    # Recompose the matrix with reduced rank
+    low_rank_matrix = torch.mm(U, torch.mm(S, V.t()))
+    return low_rank_matrix
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 parser = Arg_parser()
 args = parser.return_args()
@@ -50,7 +75,11 @@ num_epochs = args.num_epochs
 print_interval = int(num_epochs / 100)
 batch_size = args.batch_size
 lr = args.lr
+beta = args.beta
+rank = args.init_rank
 switch_epoch = args.switch_epoch
+aligned = args.alignment
+delta_rank = args.switch_to_rank
 
 # Generate data and split into training and test sets
 X, y = generate_data_without_positional_labels(p)
@@ -62,12 +91,18 @@ train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
 # Model, loss function, and optimizer
-main_model = SimpleMLP(input_dim, hidden_dim, output_dim, scale, rank = args.init_rank).to(device)
-aux_model = SimpleMLP(input_dim, hidden_dim, output_dim, scale = 0.25, rank = args.init_rank).to(device)
+aux_model = SimpleMLP(input_dim, hidden_dim, output_dim, scale = scale / 10.0, rank = rank).to(device)
+if aligned:
+    model = SimpleMLP(input_dim, hidden_dim, output_dim, scale = scale, rank = rank).to(device)
+    model.load_state_dict(aux_model.state_dict())
+    model.layer1.weight.data *= 10.0
+    model.layer2.weight.data *= 10.0
+else:
+    model = SimpleMLP(input_dim, hidden_dim, output_dim, scale, rank = rank).to(device)
 
 criterion = nn.CrossEntropyLoss()
-main_optimizer = getattr(torch.optim, args.optimizer)(
-        main_model.parameters(),
+optimizer = getattr(torch.optim, args.optimizer)(
+        model.parameters(),
         lr=lr,
         weight_decay=args.weight_decay,
     )
@@ -76,8 +111,13 @@ aux_optimizer = getattr(torch.optim, args.optimizer)(
         lr=lr,
         weight_decay=args.weight_decay,
     )
-scheduler = LrScheduler(large_lr=args.large_lr, regular_lr=args.lr, warmup_steps = 5, cutoff_steps=args.cutoff_steps)
-main_optimizer.lr = scheduler.step()
+# scheduler = LrScheduler(large_lr=args.lr, regular_lr=args.lr, warmup_steps = 10, cutoff_steps=args.cutoff_steps)
+
+num_singular_values = 8
+
+# Initialize a 2D array to store the singular values
+singular_values = np.zeros((num_singular_values, num_epochs))
+
 
 # Training and logging
 train_loss = []
@@ -85,115 +125,205 @@ test_loss = []
 train_acc = []
 test_acc = []
 jacobian_norms = []
-ntk_norms = []
+
+
 emp_ntks = []
+emp_ntk_similarity_log = []
+emp_ntk_copy = []
 init_emp_ntk = 0
+emp_ntk = 0
+
 layer1_effective_ranks = []
 layer2_effective_ranks = []
-weight = 2.0
+layer1_spec_norm = []
+layer2_spec_norm = []
+layer1_spec_norm_init = torch.linalg.norm(model.layer1.weight, ord = 2).item()
+layer2_spec_norm_init = torch.linalg.norm(model.layer2.weight, ord = 2).item()
 
+update_ranks_layer1 = []
+update_ranks_layer2 = []
+update_ranks_from_init_layer1 = []
+update_ranks_from_init_layer2 = []
+
+
+"""
+--------- train aux_model for switch_epoch steps to find an initialization for the main model ------------
+"""
+for epoch in range(switch_epoch):
+    aux_model.train()
+    running_correct = 0
+    total_train = 0
+    for inputs, labels in train_loader:
+        inputs, labels = inputs.to(device), labels.to(device)
+        aux_optimizer.zero_grad()
+        outputs = aux_model(inputs)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        aux_optimizer.step()
+        _, predicted = torch.max(outputs.data, 1)
+        running_correct += (predicted == labels).sum().item()
+        total_train += labels.size(0)
+
+    epoch_train_acc = running_correct / total_train
+    aux_model.eval()
+
+    running_correct = 0
+    total_test = 0
+    
+    # testing aux_model
+    with torch.no_grad():
+        for inputs, labels in test_loader:
+            inputs, labels = inputs.to(device), labels.to(device)  # Move data to GPU
+            outputs = aux_model(inputs)
+            _, predicted = torch.max(outputs.data, 1)
+            running_correct += (predicted == labels).sum().item()
+            total_test += labels.size(0)
+
+    epoch_test_acc = running_correct / total_test
+
+    print(f'epoch {epoch} for direction searching. '
+            f'aux train Acc: {epoch_train_acc:.2f}, '
+            f'aux test Acc: {epoch_test_acc:.2f}')
+        
+print("finished small-init model direction searching.")
+
+delta_w1 = aux_model.layer1.weight.data.clone().detach() - aux_model.W1
+delta_w2 = aux_model.layer2.weight.data.clone().detach() - aux_model.W2
+delta_w1 *= 10.0
+delta_w2 *= 10.0
+delta_w1 = low_rank_approximation(delta_w1, delta_rank)
+delta_w2 = low_rank_approximation(delta_w2, delta_rank)
+
+model.layer1.weight.data += delta_w1
+model.layer2.weight.data += delta_w2
+
+"""
+----------------------- print the initial accuracy of main before training --------------------------------
+"""
+running_correct = 0
+total_train = 0
+with torch.no_grad():
+    for inputs, labels in train_loader:
+        inputs, labels = inputs.to(device), labels.to(device)
+        outputs = model(inputs)
+        _, predicted = torch.max(outputs.data, 1)
+        running_correct += (predicted == labels).sum().item()
+        total_train += labels.size(0)
+init_acc = running_correct / total_train
+
+model.eval()
+running_correct = 0
+total_test = 0
+with torch.no_grad():
+    for inputs, labels in test_loader:
+        inputs, labels = inputs.to(device), labels.to(device)  # Move data to GPU
+        outputs = model(inputs)
+        _, predicted = torch.max(outputs.data, 1)
+        running_correct += (predicted == labels).sum().item()
+        total_test += labels.size(0)
+init_test_acc = running_correct / total_test
+print(f'main at initialization, before main training loop: '
+        f'Train Acc: {init_acc:.2f}, '
+        f'Test Acc: {init_test_acc:.2f}')
+"""
+------------------------------------------ main loop ---------------------------------------
+"""
 grads = None
 for epoch in range(num_epochs):
-    main_model.train()
-    aux_model.train()
+    model.train()
     running_loss = 0.0
     running_correct = 0
     total_train = 0
     jacobian_norm = 0
     ntk_norm = 0
-    emp_ntk = 0
-    jacobian_list_first_input = []
+    layer1_rank_pre = model.layer1.weight.clone().detach()
+    layer2_rank_pre = model.layer2.weight.clone().detach()
+    jacobian_of_each_batch = []
+    # optimizer.lr = scheduler.step()
     
     for inputs, labels in train_loader:
         inputs, labels = inputs.to(device), labels.to(device)  # Move data to GPU
         # compute the jacobian and ntk
-        jacobian_start = compute_jacobian(main_model, device, inputs)
+        jacobian_start = compute_jacobian(model, device, inputs)
 
         # optimization 
-        main_optimizer.zero_grad()
-        aux_optimizer.zero_grad()
-        outputs_main = main_model(inputs)
-        loss_main = criterion(outputs_main, labels) / float(scale**2)
-
-        if epoch <= switch_epoch:
-            print("training with aux model")
-            # Forward pass through aux model
-            outputs_aux = aux_model(inputs)
-            loss_aux = criterion(outputs_aux, labels)
-
-            # Backward pass through aux model
-            loss_aux.backward()
-            aux_optimizer.step()
-            if epoch == 0:
-              loss_main.backward()
-
-            # Copy gradients from aux_model to main_model
-            with torch.no_grad():
-                for param_main, param_aux in zip(main_model.parameters(), aux_model.parameters()):
-                    if param_main.requires_grad and param_aux.requires_grad:
-                        if param_main.grad is not None and param_aux.grad is not None:
-                            param_main.grad.copy_((weight * param_aux.grad + param_main.grad) / (1 + weight))
-        else:
-            print("training with main model")
-            loss_main.backward()
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        loss = criterion(outputs, labels)
+        loss.backward()
 
         if args.filter == "none":
             pass
         elif args.filter == "ma":
-            grads = gradfilter_ma(main_model, grads=grads, window_size=args.window_size, lamb=args.lamb)
+            grads = gradfilter_ma(model, grads=grads, window_size=args.window_size, lamb=args.lamb)
         elif args.filter == "ema":
-            grads = gradfilter_ema(main_model, grads=grads, alpha=args.alpha, lamb=args.lamb)
+            grads = gradfilter_ema(model, grads=grads, alpha=args.alpha, lamb=args.lamb)
+        elif args.filter == "smoother":
+            grads = smoother(model, grads=grads, beta=args.beta, pp=args.pp)
+        elif args.filter == "kalman":
+            grads = gradfilter_kalman(model, grads=grads, process_noise=args.process_noise, measurement_noise=args.measurement_noise, lamb=args.lamb)
         else:
             raise ValueError(f"Invalid update filter type `{args.filter}`")
         
-        main_optimizer.lr = scheduler.step()
-        main_optimizer.step()
+
+        optimizer.step()
         
-        running_loss += loss_main.item() * inputs.size(0)
-        _, predicted = torch.max(outputs_main.data, 1)
+        running_loss += loss.item() * inputs.size(0)
+        _, predicted = torch.max(outputs.data, 1)
         running_correct += (predicted == labels).sum().item()
         total_train += labels.size(0)
         # jacobian again, for the relative change
-        jacobian_end = compute_jacobian(main_model, device, inputs)
+        jacobian_end = compute_jacobian(model, device, inputs)
         jacobian_change = torch.norm(jacobian_end - jacobian_start) 
         jacobian_norm += jacobian_change / torch.norm(jacobian_start) * inputs.size(0)
+        jacobian_of_each_batch.append(jacobian_end)
+    # log the model parameters' update rank
+    layer1_update = model.layer1.weight.clone().detach() - layer1_rank_pre
+    layer2_update = model.layer2.weight.clone().detach() - layer2_rank_pre
+    layer1_update_from_init = model.layer1.weight.clone().detach() - model.W1
+    layer2_update_from_init = model.layer2.weight.clone().detach() - model.W2
 
-        # Extract the first row of the Jacobian for each batch
-        first_row_jacobian = jacobian_start[0, :].detach().cpu()
-        jacobian_list_first_input.append(first_row_jacobian)
+    update_ranks_layer1.append(compute_norm_effective_rank(layer1_update))
+    update_ranks_layer2.append(compute_norm_effective_rank(layer2_update))
+    update_ranks_from_init_layer1.append(compute_norm_effective_rank(layer1_update_from_init))
+    update_ranks_from_init_layer2.append(compute_norm_effective_rank(layer2_update_from_init))
 
-        # ntk
-        """
-        ntk_end = compute_ntk_batch(device, inputs, jacobian_end_wrt_inputs)
-        ntk_change = torch.norm(ntk_end - ntk_start)
-        ntk_norm += ntk_change / torch.norm(ntk_start) * inputs.size(0)
-        """
-      
     jacobian_norms.append(jacobian_norm.item() / total_train)
     print(f'Epoch {epoch+1}, Norm of Jacobian Change: {jacobian_norm.item() / total_train}')
-    epoch_jacobian = torch.vstack(jacobian_list_first_input).to(device)
+    epoch_jacobian = torch.vstack(jacobian_of_each_batch).to(device)
     emp_ntk = compute_ntk_batch(device, epoch_jacobian)
+    emp_ntk_copy.append(emp_ntk)
+
     # print(f"the shape of the emp_ntk is {emp_ntk.shape}\n")
     if epoch == 0:
         init_emp_ntk = emp_ntk
+
     emp_ntk_change = torch.norm(emp_ntk - init_emp_ntk, p = 'fro').item()
+    emp_ntk_similarity = compute_cosine_similarity(emp_ntk, init_emp_ntk)
+    emp_ntk_similarity_log.append(emp_ntk_similarity)
     emp_ntks.append(emp_ntk_change)
     print(f'Epoch {epoch+1}, emprical NTK change: {emp_ntk_change}')
     
+
+    # print(f'Epoch {epoch+1}, emprical NTK change: {emp_ntk_change}')
+    
     # Compute and log effective ranks of two layers
-    layer1_effective_rank = compute_norm_effective_rank(main_model.layer1.weight)
-    layer2_effective_rank = compute_norm_effective_rank(main_model.layer2.weight)
+    layer1_effective_rank = compute_norm_effective_rank(model.layer1.weight)
+    layer2_effective_rank = compute_norm_effective_rank(model.layer2.weight)
     layer1_effective_ranks.append(layer1_effective_rank)
     layer2_effective_ranks.append(layer2_effective_rank)
-    print(f'Epoch {epoch+1}, Layer1 Effective Rank: {layer1_effective_rank}')
-    print(f'Epoch {epoch+1}, Layer2 Effective Rank: {layer2_effective_rank}')
+    layer1_norm = torch.linalg.norm(model.layer1.weight, ord = 2).item() / layer1_spec_norm_init
+    layer2_norm = torch.linalg.norm(model.layer2.weight, ord = 2).item() / layer2_spec_norm_init
 
-    """
-    ntk_norms.append(ntk_norm.item() / total_train)
-    print(f'Epoch {epoch+1}, Norm of NTK Change: {ntk_norm.item() / total_train}')
-    emp_ntks.append(emp_ntk.item() / total_train)
-    print(f'Epoch {epoch+1}, emprical NTK change: {emp_ntk.item() / total_train}')
-    """
+    layer1_spec_norm.append(layer1_norm)
+    layer2_spec_norm.append(layer2_norm)
+
+
+    # log the first few significant singular values of the second layer
+    with torch.no_grad():
+        weight_matrix = model.layer2.weight.clone().detach()
+        u, s, v = torch.svd(weight_matrix)
+        singular_values[:, epoch] = s[:num_singular_values].cpu().numpy()
 
 
     epoch_loss = running_loss / total_train
@@ -201,7 +331,7 @@ for epoch in range(num_epochs):
     train_loss.append(epoch_loss)
     train_acc.append(epoch_acc)
     
-    main_model.eval()
+    model.eval()
     running_loss = 0.0
     running_correct = 0
     total_test = 0
@@ -210,8 +340,8 @@ for epoch in range(num_epochs):
     with torch.no_grad():
         for inputs, labels in test_loader:
             inputs, labels = inputs.to(device), labels.to(device)  # Move data to GPU
-            outputs = main_model(inputs)
-            loss = criterion(outputs, labels) / float(scale**2)
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
             running_loss += loss.item() * inputs.size(0)
             _, predicted = torch.max(outputs.data, 1)
             running_correct += (predicted == labels).sum().item()
@@ -240,33 +370,6 @@ for epoch in range(num_epochs):
     plt.close()
 
 
-    # Plot train, test accuracy, and Jacobian
-    fig, ax1 = plt.subplots()
-
-    color = 'tab:blue'
-    ax1.set_xlabel('Epoch')
-    ax1.set_xscale('log', base = 10)  # Set x-axis to log scale
-    ax1.set_ylabel('Accuracy (%)', color=color)
-    ax1.plot(train_acc, label='Train Accuracy', color=color)
-    ax1.plot(test_acc, label='Test Accuracy', linestyle='dashed', color=color)
-    ax1.tick_params(axis='y', labelcolor=color)
-
-    # Create a second y-axis for the Jacobian norms
-    ax2 = ax1.twinx()
-    color = 'tab:red'
-    ax2.set_ylabel('Jacobian Norm', color=color)
-    ax2.plot(jacobian_norms, label='Jacobian relative change', color=color)
-    ax2.tick_params(axis='y', labelcolor=color)
-
-    # Add legends
-    fig.tight_layout()  # Ensure the right y-label is not slightly clipped
-    fig.legend(loc='upper left')
-
-    plt.title('Accuracy and Jacobian Norm vs Epochs')
-    plt.savefig(f"results_twin_mlp/acc_jacobian_{args.label}.png")
-    plt.close()
-
-
     # Plot emprical NTK 
     fig, ax1 = plt.subplots()
 
@@ -278,7 +381,6 @@ for epoch in range(num_epochs):
     ax1.plot(test_acc, label='Test Accuracy', linestyle='dashed', color=color)
     ax1.tick_params(axis='y', labelcolor=color)
 
-    # Create a second y-axis for the Jacobian norms
     ax2 = ax1.twinx()
     color = 'tab:red'
     ax2.set_ylabel('emprical NTK', color=color)
@@ -291,6 +393,59 @@ for epoch in range(num_epochs):
 
     plt.title('Accuracy and emprical NTK vs Epochs')
     plt.savefig(f"results_twin_mlp/emprical_ntk_{args.label}.png")
+    plt.close()
+
+
+    # Plot update rank changes
+    fig, ax1 = plt.subplots()
+
+    color = 'tab:blue'
+    ax1.set_xlabel('Epoch')
+    ax1.set_xscale('log', base = 10)  # Set x-axis to log scale
+    ax1.set_ylabel('Accuracy (%)', color=color)
+    ax1.plot(train_acc, label='Train Accuracy', color=color)
+    ax1.plot(test_acc, label='Test Accuracy', linestyle='dashed', color=color)
+    ax1.tick_params(axis='y', labelcolor=color)
+
+    ax2 = ax1.twinx()
+    color = 'tab:red'
+    ax2.set_ylabel('weights update rank', color=color)
+    ax2.plot(update_ranks_layer1, label='layer1', color=color)
+    ax2.plot(update_ranks_layer2, label='layer2',linestyle='dashed' ,color=color)
+    ax2.tick_params(axis='y', labelcolor=color)
+
+    # Add legends
+    fig.tight_layout()  # Ensure the right y-label is not slightly clipped
+    fig.legend(loc='upper left')
+
+    plt.title('Accuracy and weights update rank vs Epochs')
+    plt.savefig(f"results_twin_mlp/weights_update_rank_{args.label}.png")
+    plt.close()
+
+    # Plot update rank changes from the init
+    fig, ax1 = plt.subplots()
+
+    color = 'tab:blue'
+    ax1.set_xlabel('Epoch')
+    ax1.set_xscale('log', base = 10)  # Set x-axis to log scale
+    ax1.set_ylabel('Accuracy (%)', color=color)
+    ax1.plot(train_acc, label='Train Accuracy', color=color)
+    ax1.plot(test_acc, label='Test Accuracy', linestyle='dashed', color=color)
+    ax1.tick_params(axis='y', labelcolor=color)
+
+    ax2 = ax1.twinx()
+    color = 'tab:red'
+    ax2.set_ylabel('weights update rank from init', color=color)
+    ax2.plot(update_ranks_from_init_layer1, label='layer1', color=color)
+    ax2.plot(update_ranks_from_init_layer2, label='layer2', linestyle='dashed', color=color)
+    ax2.tick_params(axis='y', labelcolor=color)
+
+    # Add legends
+    fig.tight_layout()  # Ensure the right y-label is not slightly clipped
+    fig.legend(loc='upper left')
+
+    plt.title('Accuracy and weights update rank vs Epochs')
+    plt.savefig(f"results_twin_mlp/weights_update_rank_from_init_{args.label}.png")
     plt.close()
     
     # Plot effective ranks
@@ -309,7 +464,7 @@ for epoch in range(num_epochs):
     color = 'tab:green'
     ax2.set_ylabel('effective ranks', color=color)
     ax2.plot(layer1_effective_ranks, label='layer 1', color=color)
-    ax2.plot(layer2_effective_ranks, label='layer 2', color=color)
+    ax2.plot(layer2_effective_ranks, label='layer 2', linestyle='dashed', color=color)
     ax2.tick_params(axis='y', labelcolor=color)
 
     # Add legends
@@ -319,3 +474,96 @@ for epoch in range(num_epochs):
     plt.title('Accuracy and Weight Ranks vs Epochs')
     plt.savefig(f"results_twin_mlp/rank_{args.label}.png")
     plt.close()
+
+    # Plot effective ranks
+    fig, ax1 = plt.subplots()
+
+    color = 'tab:blue'
+    ax1.set_xlabel('Epoch')
+    ax1.set_xscale('log', base = 10)  # Set x-axis to log scale
+    ax1.set_ylabel('Accuracy (%)', color=color)
+    ax1.plot(train_acc, label='Train Accuracy', color=color)
+    ax1.plot(test_acc, label='Test Accuracy', linestyle='dashed', color=color)
+    ax1.tick_params(axis='y', labelcolor=color)
+
+    # Create a second y-axis for the Jacobian norms
+    ax2 = ax1.twinx()
+    color = 'tab:green'
+    ax2.set_ylabel('spectral norm', color=color)
+    ax2.plot(layer1_spec_norm, label='layer 1', color=color)
+    ax2.plot(layer2_spec_norm, label='layer 2', linestyle='dashed', color=color)
+    ax2.tick_params(axis='y', labelcolor=color)
+
+    # Add legends
+    fig.tight_layout()  # Ensure the right y-label is not slightly clipped
+    fig.legend(loc='upper left')
+
+    plt.title('Accuracy and Spectral Norm vs Epochs')
+    plt.savefig(f"results_twin_mlp/spec_norm_{args.label}.png")
+    plt.close()
+
+
+    # Define a colormap
+    cmap = plt.get_cmap('tab10')  # 'tab10' has 10 different colors
+
+    # Plot the singular values evolution
+    fig, ax1 = plt.subplots()
+
+    color = 'tab:blue'
+    ax1.set_xlabel('Epoch')
+    ax1.set_xscale('log', base=10)  # Set x-axis to log scale
+    ax1.set_ylabel('Accuracy (%)', color=color)
+    ax1.plot(train_acc, label='Train Accuracy', color=color)
+    ax1.plot(test_acc, label='Test Accuracy', linestyle='dashed', color=color)
+    ax1.tick_params(axis='y', labelcolor=color)
+
+    # Create a second y-axis for the singular values
+    ax2 = ax1.twinx()
+    ax2.set_ylabel('S.V. ', color='tab:green')
+
+    # Plot each singular value with a different color
+    for i in range(num_singular_values):
+        ax2.plot(singular_values[i, :], label=f'Singular Value {i+1}', color=cmap(i + 1))
+    ax2.tick_params(axis='y', labelcolor='tab:green')
+
+    # Add legends
+    fig.tight_layout()  # Ensure the right y-label is not slightly clipped
+    fig.legend(loc='upper left')
+
+    plt.title('Accuracy and Singular Values vs Epochs')
+    plt.savefig(f"results_twin_mlp/singular_val_{args.label}.png")
+    plt.close()
+
+final_emp_ntk = emp_ntk
+
+emp_ntk_alignment = []
+for epoch in range(num_epochs):
+    emp_ntk_alignment.append(compute_cosine_similarity(emp_ntk_copy[epoch], final_emp_ntk))
+
+
+# Plot NTK alignment
+
+fig, ax1 = plt.subplots()
+
+color = 'tab:blue'
+ax1.set_xlabel('Epoch')
+ax1.set_xscale('log', base = 10)  # Set x-axis to log scale
+ax1.set_ylabel('Accuracy (%)', color=color)
+ax1.plot(train_acc, label='Train Accuracy', color=color)
+ax1.plot(test_acc, label='Test Accuracy', linestyle='dashed', color=color)
+ax1.tick_params(axis='y', labelcolor=color)
+
+ax2 = ax1.twinx()
+color = 'tab:green'
+ax2.set_ylabel('NTK alignment', color=color)
+ax2.plot(emp_ntk_similarity_log, label='alignment with init', color=color)
+ax2.plot(emp_ntk_alignment, label='alignment with final', linestyle='dashed', color=color)
+ax2.tick_params(axis='y', labelcolor=color)
+
+# Add legends
+fig.tight_layout()  # Ensure the right y-label is not slightly clipped
+fig.legend(loc='upper left')
+
+plt.title('Accuracy and NTK alignment vs Epochs')
+plt.savefig(f"results_twin_mlp/NTK_alignment_{args.label}.png")
+plt.close()

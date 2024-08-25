@@ -13,24 +13,58 @@ import torch.nn.functional as F
 
 from grokfast import *
 
+class LoRALinear(nn.Module):
+    """Low-Rank Linear Layer for LoRA"""
+
+    def __init__(self, in_features, out_features, rank):
+        super().__init__()
+        self.rank = rank
+        self.W = nn.Linear(in_features, out_features, bias=False)  # Original weight matrix
+        # freeze it
+        for param in self.W.parameters():
+            param.requires_grad = False
+        self.A = nn.Parameter(torch.randn(out_features, rank) / rank)  # Low-rank matrix A
+        self.B = nn.Parameter(torch.randn(in_features, rank) / rank)  # Low-rank matrix B
+        self.weight = self.W.weight.clone().detach() + self.A @ self.B.T
+
+    def forward(self, x):
+        self.weight = self.W.weight.clone().detach() + self.A @ self.B.T
+        # First, apply the frozen weight matrix
+        output = self.W(x)
+        # Then, apply the LoRA low-rank transformation
+        low_rank_output = x @ self.B  # shape (batch_size, rank)
+        low_rank_output = low_rank_output @ self.A.T  # shape (batch_size, out_features)
+        return output + low_rank_output
+        
 class Block(nn.Module):
     """Causal transformer block
     """
 
-    def __init__(self, dim, num_heads, rank = None):
+    def __init__(self, dim, num_heads, beta = None, rank = None, LoRA_rank = None):
         super().__init__()
         self.ln_1 = nn.LayerNorm(dim)
         self.ln_2 = nn.LayerNorm(dim)
         self.attn = nn.MultiheadAttention(dim, num_heads)
+        # LoRA applied to the MLP layers
+        self.mlp_fc1 = LoRALinear(dim, dim * 4, LoRA_rank) if LoRA_rank else nn.Linear(dim, dim * 4)
+        self.mlp_fc2 = LoRALinear(dim * 4, dim, LoRA_rank) if LoRA_rank else nn.Linear(dim * 4, dim)
+        self.activation = nn.GELU()
         self.mlp = nn.Sequential(
-            nn.Linear(dim, dim * 4),
-            nn.GELU(),
-            nn.Linear(dim * 4, dim),
+            self.mlp_fc1,
+            self.activation,
+            self.mlp_fc2,
         )
+        
         self.rank = rank
+
+        if beta is not None:
+            self.attn.in_proj_weight.data *= beta
+            # self.attn.out_proj.weight.data *= beta
+
         if rank is not None:
-          print(f"using rank {rank} for in_proj_matrix.")
-          self.attn.in_proj_weight.data = self.low_rank_approximation(self.attn.in_proj_weight, rank)
+          print(f"using rank {rank} initialization for all feedforward layers in blocks.")
+          self.mlp[0].weight.data = self.low_rank_approximation(self.mlp[0].weight.data, rank)
+          self.mlp[2].weight.data = self.low_rank_approximation(self.mlp[2].weight.data, rank)
 
 
 
@@ -44,7 +78,11 @@ class Block(nn.Module):
         x = self.ln_1(x)
         a, _ = self.attn(x, x, x, attn_mask=attn_mask, need_weights=False)
         x = x + a
-        m = self.mlp(self.ln_2(x))
+        # Apply LoRA-augmented MLP
+        m = self.mlp_fc1(self.ln_2(x))
+        m = self.activation(m)
+        m = self.mlp_fc2(m)
+        
         x = x + m
         return x
     
@@ -59,18 +97,17 @@ class Block(nn.Module):
         low_rank_matrix = torch.mm(U, torch.mm(S, V.t()))
         return low_rank_matrix
 
-
 class Decoder(nn.Module):
     """Causal Transformer decoder
     """
 
-    def __init__(self, dim=128, num_layers=2, num_heads=4, num_tokens=97, seq_len=5, rank = None):
+    def __init__(self, dim=128, num_layers=2, num_heads=4, num_tokens=97, seq_len=5, beta = None, rank = None, LoRA_rank = None):
         super().__init__()
         self.token_embeddings = nn.Embedding(num_tokens, dim)
         self.position_embeddings = nn.Embedding(seq_len, dim)
         self.layers = nn.ModuleList()
-        for _ in range(num_layers):
-            self.layers.append(Block(dim, num_heads, rank))
+        for i in range(num_layers):
+            self.layers.append(Block(dim, num_heads, beta, rank, LoRA_rank))
 
         self.ln_f = nn.LayerNorm(dim)
         self.head = nn.Linear(dim, num_tokens, bias=False)
@@ -104,28 +141,57 @@ def multiplication_mod_p_data(p, eq_token, op_token):
     return torch.stack([x, op, y, eq, result])
 
 class SimpleMLP(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, scale=1, rank=None):
+    def __init__(self, input_dim, hidden_dim, output_dim, scale=1.0, activation = 'quadratic', beta = None, rank=None, sparse_init = 'none', sparsity = 0.8):
         super(SimpleMLP, self).__init__()
         self.D = input_dim
         self.N = hidden_dim
         self.scale = scale
         self.rank = rank
+        self.activation = activation
 
         self.layer1 = nn.Linear(input_dim, hidden_dim, bias=False)
         self.layer2 = nn.Linear(hidden_dim, output_dim, bias=False)
+        
+        self.layer1.weight.data *= scale
+        self.layer2.weight.data *= scale
+
+        if beta is not None:
+            self.layer1.weight.data *= beta
 
         if rank is not None:
-          print(f"set init rank to be {rank}.")
-          self.initialize_low_rank(self.layer1, rank)
-          self.initialize_low_rank(self.layer2, rank)
+            print(f"set init rank to be {rank}.")
+            self.initialize_low_rank(rank)
+
+        if sparse_init == 'random':
+            print(f"initialized with a random sparse mask.")
+            self.random_sparse_mask(sparsity=sparsity)
+        elif sparse_init == 'lottery':
+            pass
+        else:
+            pass
+
+        self.W1 = self.layer1.weight.data.clone().detach()
+        self.W2 = self.layer2.weight.data.clone().detach()
+
+        # self.nfm1 = torch.mm(self.layer1.weight.data.t(), self.layer1.weight.data)
+        # self.nfm2 = torch.mm(self.layer2.weight.data.t(), self.layer2.weight.data)
 
     def forward(self, x):
         x = self.layer1(x)
-        x = x**2 
+        if self.activation == 'quadratic':
+            x = x**2 
+        elif self.activation == 'relu':
+            x = F.relu(x)
+        else:
+            print("warning: you are using a linear model")
         x = self.layer2(x)
-        return x * self.scale
+        
+        #self.nfm1 = torch.mm(self.layer1.weight.data.t(), self.layer1.weight.data)
+        #self.nfm2 = torch.mm(self.layer2.weight.data.t(), self.layer2.weight.data)
 
-    def initialize_low_rank(self, layer, rank):
+        return x 
+
+    def initialize_low_rank_layer(self, layer, rank):
         # Get the weight matrix of the layer
         weight = layer.weight.data
 
@@ -142,9 +208,37 @@ class SimpleMLP(nn.Module):
 
         # Set the layer's weight to the low-rank approximation
         layer.weight.data = low_rank_weight
+    
+    def initialize_low_rank(self, rank):
+        self.initialize_low_rank_layer(self.layer1, rank)
+        self.initialize_low_rank_layer(self.layer2, rank)
+    
+    def random_sparse_mask_layer(self, layer, sparsity_level):
+        # Get the number of parameters in the layer
+        num_params = layer.weight.numel()
+        # Determine the number of non-zero weights
+        num_nonzero = int((1 - sparsity_level) * num_params)
+        
+        # Create a mask with the desired sparsity level
+        mask = torch.zeros(num_params)
+        mask[:num_nonzero] = 1
+        mask = mask[torch.randperm(num_params)].view_as(layer.weight)
+        
+        # Apply the mask
+        layer.weight.data.mul_(mask)
+    
+    def random_sparse_mask(self, sparsity = 0.8):
+        self.random_sparse_mask_layer(self.layer1, sparsity)
+        self.random_sparse_mask_layer(self.layer2, sparsity)
+    def to(self, device):
+        super(SimpleMLP, self).to(device)
+        self.W1 = self.W1.to(device)
+        self.W2 = self.W2.to(device)
+        return self
+        
 
 class SimpleMLP_LoRA(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, scale=1, rank = 16, switch_epoch = 10, init_rank = None):
+    def __init__(self, input_dim, hidden_dim, output_dim, scale=1, rank = 16, switch_epoch = 10, beta = 1.0, init_rank = None):
         super(SimpleMLP_LoRA, self).__init__()
         self.D = input_dim
         self.N = hidden_dim
@@ -152,6 +246,10 @@ class SimpleMLP_LoRA(nn.Module):
         self.rank = rank
         self.layer1 = nn.Linear(input_dim, hidden_dim, bias=False)
         self.layer2 = nn.Linear(hidden_dim, output_dim, bias=False)
+        # upstream unbalanced initialization
+        if beta is not None:
+          self.layer1.weight.data *= beta
+
         self.epoch = 0
         self.switch_epoch = switch_epoch
 
@@ -176,6 +274,8 @@ class SimpleMLP_LoRA(nn.Module):
 
         self.effective_weights1 = self.layer1.weight.clone().detach()
         self.effective_weights2 = self.layer2.weight.clone().detach()
+        self.nfm1 = torch.mm(self.effective_weights1.data.t(), self.effective_weights1.data)
+        self.nfm2 = torch.mm(self.effective_weights2.data.t(), self.effective_weights2.data)
 
 
     def forward(self, x):
@@ -190,24 +290,29 @@ class SimpleMLP_LoRA(nn.Module):
           W2 = self.layer2.weight.t() + torch.matmul(self.A2, self.B2)
           self.effective_weights2 = W2.t()
           x = torch.matmul(x, W2)
+          self.nfm1 = torch.mm(self.effective_weights1.data.t(), self.effective_weights1.data)
+          self.nfm2 = torch.mm(self.effective_weights2.data.t(), self.effective_weights2.data)
           return x * self.scale  # Scale the final output
         elif self.epoch == self.switch_epoch:
           self.switch()
           x = self.layer1(x)
           x = x**2
           x = self.layer2(x)
-          self.effective_weights1 = self.layer1.weight.clone().detach()
-          self.effective_weights2 = self.layer2.weight.clone().detach()
+          self.update_nfm_and_effective_weights()
           return x * self.scale  # Scale the final output
         else:
           x = self.layer1(x)
           x = x**2
           x = self.layer2(x)
-          self.effective_weights1 = self.layer1.weight.clone().detach()
-          self.effective_weights2 = self.layer2.weight.clone().detach()
+          self.update_nfm_and_effective_weights()
           return x * self.scale  # Scale the final output
 
-    
+    def update_nfm_and_effective_weights(self):
+        self.effective_weights1 = self.layer1.weight.clone().detach()
+        self.effective_weights2 = self.layer2.weight.clone().detach()
+        self.nfm1 = torch.mm(self.effective_weights1.data.t(), self.effective_weights1.data)
+        self.nfm2 = torch.mm(self.effective_weights2.data.t(), self.effective_weights2.data)
+
     def switch(self):
         # Unfreeze the original weights initially
         # switch to normal full parameters training
@@ -332,6 +437,12 @@ def compute_jacobian(model, device, x, wrt='parameters'):
     model = model.to(device)
     x = x.to(device)
     output = model(x)
+
+    # Check if the output contains NaN or inf
+    if torch.isnan(output).any():
+        raise ValueError("Model output contains NaN values.")
+    if torch.isinf(output).any():
+        raise ValueError("Model output contains inf values.")
     
     jacobian = []
     param_list = [p for p in model.parameters() if p.requires_grad]
@@ -350,11 +461,19 @@ def compute_jacobian(model, device, x, wrt='parameters'):
             jacobian_row = torch.cat([g.flatten() for g in jacobian_row])
         else:
             raise ValueError("wrt must be 'inputs' or 'parameters'")
+
+        # Check if the gradient contains NaN or inf
+        if torch.isnan(jacobian_row).any():
+            raise ValueError(f"Jacobian row {i} contains NaN values.")
+        if torch.isinf(jacobian_row).any():
+            raise ValueError(f"Jacobian row {i} contains inf values.")
         
         jacobian.append(jacobian_row)
     
     # Stack the rows to form the Jacobian matrix
     jacobian = torch.stack(jacobian)
+    # flatten all output dimensions to 1d vector
+    jacobian = torch.cat([g.flatten() for g in jacobian])
     return jacobian
 
 # Function to compute NTK for a batch of data
@@ -378,3 +497,4 @@ def compute_ntk_batch(device, jacobian):
             ntk_batch[i, j] = torch.dot(jacobian[i].view(-1), jacobian[j].view(-1))
     
     return ntk_batch
+

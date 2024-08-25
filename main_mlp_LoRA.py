@@ -29,6 +29,24 @@ def compute_norm_effective_rank(weight_matrix):
     rank = torch.linalg.matrix_rank(weight_matrix)
     effective_rank = effective_rank / rank
     return effective_rank.item()
+
+def compute_cosine_similarity(matrix1, matrix2):
+    # Flatten the matrices into vectors
+    vec1 = matrix1.view(-1)
+    vec2 = matrix2.view(-1)
+    
+    # Compute the dot product of the two vectors
+    dot_product = torch.dot(vec1, vec2)
+    
+    # Compute the magnitude (Euclidean norm) of each vector
+    magnitude_vec1 = torch.norm(vec1)
+    magnitude_vec2 = torch.norm(vec2)
+    
+    # Compute the cosine similarity
+    cosine_sim = dot_product / (magnitude_vec1 * magnitude_vec2)
+    
+    return cosine_sim.item()  # Convert to a Python float for readability
+
     
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 parser = Arg_parser()
@@ -47,6 +65,8 @@ batch_size = args.batch_size
 lr = args.lr
 LoRA_rank = args.LoRA_rank
 switch_epoch = args.switch_epoch
+beta = args.beta
+init_rank = args.init_rank
 
 # Generate data and split into training and test sets
 X, y = generate_data_without_positional_labels(p)
@@ -58,7 +78,7 @@ train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
 # Model, loss function, and optimizer
-model = SimpleMLP_LoRA(input_dim, hidden_dim, output_dim, scale, rank= LoRA_rank, switch_epoch = switch_epoch).to(device)
+model = SimpleMLP_LoRA(input_dim, hidden_dim, output_dim, scale, rank= LoRA_rank, switch_epoch = switch_epoch, beta = beta, init_rank = init_rank).to(device)
 criterion = nn.CrossEntropyLoss()
 optimizer = getattr(torch.optim, args.optimizer)(
         model.parameters(),
@@ -78,11 +98,16 @@ test_loss = []
 train_acc = []
 test_acc = []
 jacobian_norms = []
-ntk_norms = []
+
 emp_ntks = []
 init_emp_ntk = 0
 layer1_effective_ranks = []
 layer2_effective_ranks = []
+
+nfm1_rank = []
+nfm2_rank = []
+nfm1 = []
+nfm2 = []
 
 grads = None
 for epoch in range(num_epochs):
@@ -91,9 +116,8 @@ for epoch in range(num_epochs):
     running_correct = 0
     total_train = 0
     jacobian_norm = 0
-    ntk_norm = 0
-    emp_ntk = 0
-    jacobian_list_first_input = []
+    emp_ntk = 0 
+    optimizer.lr = scheduler.step()
     
     
     for inputs, labels in train_loader:
@@ -126,7 +150,7 @@ for epoch in range(num_epochs):
         else:
             raise ValueError(f"Invalid update filter type `{args.filter}`")
         
-        optimizer.lr = scheduler.step()
+
         optimizer.step()
         
         running_loss += loss.item() * inputs.size(0)
@@ -138,9 +162,9 @@ for epoch in range(num_epochs):
         jacobian_change = torch.norm(jacobian_end - jacobian_start) 
         jacobian_norm += jacobian_change / torch.norm(jacobian_start) * inputs.size(0)
 
-        # Extract the first row of the Jacobian for each batch
-        first_row_jacobian = jacobian_start[0, :].detach().cpu()
-        jacobian_list_first_input.append(first_row_jacobian)
+        ntk_batch = compute_ntk_batch(model, device, inputs)
+        emp_ntk += ntk_batch * inputs.size(0)
+
 
 
     """
@@ -151,11 +175,12 @@ for epoch in range(num_epochs):
     model.epoch += 1
     jacobian_norms.append(jacobian_norm.item() / total_train)
     print(f'Epoch {epoch+1}, Norm of Jacobian Change: {jacobian_norm.item() / total_train}')
-    epoch_jacobian = torch.vstack(jacobian_list_first_input).to(device)
-    emp_ntk = compute_ntk_batch(device, epoch_jacobian)
+    emp_ntk = emp_ntk / total_train
+
     # print(f"the shape of the emp_ntk is {emp_ntk.shape}\n")
     if epoch == 0:
         init_emp_ntk = emp_ntk
+
     emp_ntk_change = torch.norm(emp_ntk - init_emp_ntk, p = 'fro').item()
     emp_ntks.append(emp_ntk_change)
     print(f'Epoch {epoch+1}, emprical NTK change: {emp_ntk_change}')
@@ -200,6 +225,11 @@ for epoch in range(num_epochs):
     epoch_acc = running_correct / total_test
     test_loss.append(epoch_loss)
     test_acc.append(epoch_acc)
+
+    nfm1_rank.append(compute_norm_effective_rank(model.nfm1))
+    nfm2_rank.append(compute_norm_effective_rank(model.nfm2))
+    nfm1.append(model.nfm1)
+    nfm2.append(model.nfm2)
     
     if epoch % print_interval == 0:
       print(f'Epoch {epoch + 1}/{num_epochs}, '
@@ -329,3 +359,65 @@ for epoch in range(num_epochs):
     plt.title('Accuracy and Singular Values vs Epochs')
     plt.savefig(f"results_mlp_LoRA/singular_val_{args.label}.png")
     plt.close()
+
+    # Plot effective ranks for nfms
+    fig, ax1 = plt.subplots()
+
+    color = 'tab:blue'
+    ax1.set_xlabel('Epoch')
+    ax1.set_xscale('log', base = 10)  # Set x-axis to log scale
+    ax1.set_ylabel('Accuracy (%)', color=color)
+    ax1.plot(train_acc, label='Train Accuracy', color=color)
+    ax1.plot(test_acc, label='Test Accuracy', linestyle='dashed', color=color)
+    ax1.tick_params(axis='y', labelcolor=color)
+
+    ax2 = ax1.twinx()
+    color = 'tab:green'
+    ax2.set_ylabel('NFM effective rank', color=color)
+    ax2.plot(nfm1_rank, label='layer 1', color=color)
+    ax2.plot(nfm2_rank, label='layer 2', linestyle='dashed', color=color)
+    ax2.tick_params(axis='y', labelcolor=color)
+
+    # Add legends
+    fig.tight_layout()  # Ensure the right y-label is not slightly clipped
+    fig.legend(loc='upper left')
+
+    plt.title('Accuracy and NFM rank vs Epochs')
+    plt.savefig(f"results_mlp_LoRA/NFM_rank_{args.label}.png")
+    plt.close()
+
+final_nfm1 = model.nfm1
+final_nfm2 = model.nfm2
+
+nfm1_alignment = []
+nfm2_alignment = []
+for epoch in range(num_epochs):
+    nfm1_alignment.append(compute_cosine_similarity(nfm1[epoch], final_nfm1))
+    nfm2_alignment.append(compute_cosine_similarity(nfm2[epoch], final_nfm2))
+
+# Plot nfm alignment
+fig, ax1 = plt.subplots()
+
+color = 'tab:blue'
+ax1.set_xlabel('Epoch')
+ax1.set_xscale('log', base = 10)  # Set x-axis to log scale
+ax1.set_ylabel('Accuracy (%)', color=color)
+ax1.plot(train_acc, label='Train Accuracy', color=color)
+ax1.plot(test_acc, label='Test Accuracy', linestyle='dashed', color=color)
+ax1.tick_params(axis='y', labelcolor=color)
+
+ax2 = ax1.twinx()
+color = 'tab:green'
+ax2.set_ylabel('NFM alignment', color=color)
+ax2.plot(nfm1_alignment, label='layer 1', color=color)
+ax2.plot(nfm2_alignment, label='layer 2', linestyle='dashed', color=color)
+ax2.tick_params(axis='y', labelcolor=color)
+
+# Add legends
+fig.tight_layout()  # Ensure the right y-label is not slightly clipped
+fig.legend(loc='upper left')
+
+plt.title('Accuracy and NFM alignment vs Epochs')
+plt.savefig(f"results_mlp_LoRA/NFM_alignment_{args.label}.png")
+plt.close()
+

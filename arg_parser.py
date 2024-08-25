@@ -26,17 +26,33 @@ class Arg_parser():
         parser.add_argument("--measurement_noise", type=float, default=1e-2)
 
         # Smoother
+        """
         parser.add_argument("--beta", type=float, default=0.98)
         parser.add_argument("--pp", type=float, default=0.01)
+        """
 
         # for MLP
         parser.add_argument("--hidden_dim", type=int, default= 128)
         parser.add_argument("--init_scale", type=float, default=1.0)
         parser.add_argument("--num_epochs", type=int, default= 10000)
         parser.add_argument("--fraction", type=float, default=0.5)
-        parser.add_argument("--LoRA_rank", type = int, default= 16)
+        parser.add_argument("--LoRA_rank", type = int, default= None)
         parser.add_argument("--switch_epoch", type = int, default= 50)
-        parser.add_argument("--init_rank", type = int, default = 5)
+        parser.add_argument("--init_rank", type = int, default = None)
+
+        # earlier layer-specific initialization
+        parser.add_argument("--beta", type = float, default = None)
+
+        # for twin-training
+        parser.add_argument("--alignment", action='store_true')
+
+        # for low-rank switch
+        parser.add_argument("--low_rank_switch", action='store_true')
+        parser.add_argument("--switch_to_rank", type = int, default = 4)
+
+        # for sparse init
+        parser.add_argument("--sparse_init", type=str, choices=['none', 'random', 'lottery'], default='none')
+        parser.add_argument("--sparsity", type = float, default = 0.8)
 
 
         # Ablation studies
@@ -54,8 +70,6 @@ class Arg_parser():
         alpha_str = f'_a{args.alpha:.3f}'.replace('.', '')
         lamb_str = f'_l{int(args.lamb)}'
         optimizer_str = f'_optimizer{args.optimizer}'
-        beta_str = f'_beta{args.beta}'
-        pp_str = f'_pp{args.pp}'
         large_lr_str = f'_large_lr{args.large_lr}'
         cutoff_steps_str = f'_cutoff_steps{args.cutoff_steps}'
         

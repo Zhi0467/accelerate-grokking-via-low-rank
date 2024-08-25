@@ -1,50 +1,40 @@
 import subprocess
 
-
 configs1 = [ 
 {
         "label": "1",
         "filter": "none",
-        "p": 97,
-        "weight_decay": 0.1,
+        "weight_decay": 0.001,
         "optimizer": "AdamW",
         "alpha": 0.95,
-        "lamb": 5.0,
-        "batch_size": 256,
-        "lr": 5e-3,
+        "lamb": 2.0,
+        "batch_size": 128,
+        "lr": 4e-3,
         "hidden_dim": 256,
-        "fraction": 0.5,
-        "switch_epoch": 20,
-        "init_scale": 32.0,
-        "alignment": True,
-        "switch_to_rank": 1,
-        "num_epochs": 1000,
+        "init_scale": 8.0,
+        "num_epochs": 1500,
         "save_weights": False,
 },
 {
         "label": "2",
         "filter": "none",
-        "p": 97,
-        "weight_decay": 0.1,
+        "weight_decay": 0.001,
         "optimizer": "AdamW",
         "alpha": 0.95,
-        "lamb": 5.0,
-        "batch_size": 256,
-        "lr": 5e-3,
+        "lamb": 2.0,
+        "batch_size": 128,
+        "lr": 4e-3,
         "hidden_dim": 256,
-        "fraction": 0.5,
-        "switch_epoch": 20,
-        "init_scale": 32.0,
-        "alignment": False,
-        "switch_to_rank": 1,
-        "num_epochs": 1000,
+        "init_scale": 8.0,
+        "init_rank": 4,
+        "num_epochs": 1500,
         "save_weights": False,
 },
 ]
 
 # Function to run the main program with specified arguments
-def run_experiment_in_main_twin_mlp(config):
-    cmd = ["python", "main_twin_mlp.py"]
+def run_experiment_in_main_mlp_cifar10(config):
+    cmd = ["python", "main_mlp_cifar10.py"]
     for key, value in config.items():
         if isinstance(value, bool):
             if value:  # Only add the flag if it's set to True
@@ -58,5 +48,5 @@ def run_experiment_in_main_twin_mlp(config):
 
 # Run experiments with different configurations
 for config in configs1:
-    run_experiment_in_main_twin_mlp(config)
+    run_experiment_in_main_mlp_cifar10(config)
 

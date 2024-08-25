@@ -1,25 +1,23 @@
 import subprocess
 
-# In this config: we grid search post_grokfast
-# on lamb
-# we keep wd = 0.1 so that AdamW doesn't dominate the training
-# we skip lamb = 2.0 , 3.0 because they are tested in configs 8 and 9
 configs1 = [ 
 {
         "label": "1",
-        "filter": "ema",
+        "filter": "none",
         "p": 97,
         "weight_decay": 0.1,
         "optimizer": "AdamW",
         "alpha": 0.95,
         "lamb": 5.0,
-        "batch_size": 512,
-        "lr": 4e-3,
+        "batch_size": 256,
+        "lr": 5e-3,
         "hidden_dim": 256,
         "fraction": 0.5,
-        "init_rank": 1,
-        "init_scale": 8.0,
+        "init_scale": 32.0,
         "num_epochs": 1000,
+        "sparse_init": 'random',
+        "sparsity": 0.8,
+        "low_rank_switch": False,
         "save_weights": False,
 },
 {
@@ -30,13 +28,15 @@ configs1 = [
         "optimizer": "AdamW",
         "alpha": 0.95,
         "lamb": 5.0,
-        "batch_size": 512,
-        "lr": 4e-3,
+        "batch_size": 256,
+        "lr": 5e-3,
         "hidden_dim": 256,
         "fraction": 0.5,
-        "init_rank": 1,
-        "init_scale": 8.0,
+        "switch_epoch": 20,
+        "init_scale": 32.0,
         "num_epochs": 1000,
+        "low_rank_switch": True,
+        "switch_to_rank": 2,
         "save_weights": False,
 },
 ]

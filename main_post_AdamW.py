@@ -81,9 +81,7 @@ def main(args):
     # the answer part of the equation. For all experiments we used a
     # transformer with 2 layers, width 128, and 4 attention heads"
     num_layers = 2
-    model = Decoder(
-        dim=128, num_layers = num_layers, num_heads=4, num_tokens=args.p + 2, seq_len=5, rank = args.init_rank
-    ).to(device)
+    model = Decoder(dim=128, num_layers = num_layers, num_heads=4, num_tokens=args.p + 2, seq_len=5, beta = args.beta, rank = args.init_rank, LoRA_rank = args.LoRA_rank).to(device)
     nparams = sum([p.numel() for p in model.parameters() if p.requires_grad])
     print(model)
     print(f'Total number of parameters: {nparams}')
@@ -140,11 +138,11 @@ def main(args):
     net_its, nets = [], []
 
     initial_state = copy.deepcopy(model.state_dict())
-    init_vector = torch.cat([p.view(-1) for p in initial_state.values()])
+    init_vector = torch.cat([p.view(-1) for p in initial_state.values() if p.requires_grad])
 
     param_norms_l2, param_distances_l2 = [], []
     param_norms_l1, param_distances_l1 = [], []
-    sparsity_log = []
+
     count = 0
     grads_similarity_log = [None for _ in range(len(cos_sim_interval))]
     current_grad_vector = [None for _ in range(len(cos_sim_interval))]
@@ -197,13 +195,7 @@ def main(args):
                     total_loss += loss.item() * input.shape[-1]
 
                 if is_train:
-                    # compute the jacobian 
-                    """
-                    jacobian_start = compute_jacobian(model, device, input[:-1])
-                    print("Jacobian tensor device:", jacobian_start.device)
-                    norm = torch.norm(jacobian_start)
-                    print(f'Epoch {e+1}, Norm of Jacobian: {norm.item()}')
-                    """
+
                     model.zero_grad()
                     loss.backward()
                     
@@ -240,28 +232,6 @@ def main(args):
                     optimizer.lr = scheduler.step()
                     optimizer.update(i + 1)
 
-                
-                    """
-                    # Apply the modified gradients to the parameters
-                    
-                    for n, p in model.named_parameters():
-                        if p.requires_grad and p.grad is not None:
-                            p.data.add_(-grads[n])
-                   
-                    # Check if gradients are zero
-                    zero_gradients = True
-                    for name, param in model.named_parameters():
-                        if param.requires_grad and param.grad is not None:
-                            if not torch.all(param.grad == 0):
-                                zero_gradients = False
-                                break
-
-                    if zero_gradients:
-                        print("All gradients are zero")
-                    else:
-                        print("Non-zero gradients found")
-                    """
-
                     # Compute and log gradient angles every cos_sim_interval steps
                     count = 0
                     for interval in cos_sim_interval:
@@ -277,13 +247,7 @@ def main(args):
 
                     torch_optimizer.step()
                     torch_optimizer.zero_grad()
-                    # compute the jacobian 
-                    """
-                    jacobian_end = compute_jacobian(model, device, input[:-1])
-                    jacobian_change = torch.norm(jacobian_end - jacobian_start) 
-                    jacobian_norm = jacobian_change / torch.norm(jacobian_start)
-                    total_jacobian_norm_change += jacobian_norm.item() * input.shape[-1]
-                    """
+   
                     # Zero gradients after update
                     i += 1
 
@@ -292,21 +256,20 @@ def main(args):
                 
 
             if is_train:
-                # jacobian_norms.append(total_jacobian_norm_change / train_data.shape[-1])
                 train_acc.append(total_acc / train_data.shape[-1])
                 train_loss.append(total_loss / train_data.shape[-1])
                 its.append(i)
                 # print(f"\n Training: Epoch {e}, Iteration {i}, Loss: {total_loss / train_data.shape[-1]}, Accuracy: {total_acc / train_data.shape[-1]}")
-                # print(f'Epoch {e+1}, Norm of Jacobian Change: {jacobian_norm.item()}')
+
             else:
                 val_acc.append(total_acc / valid_data.shape[-1])
                 val_loss.append(total_loss / valid_data.shape[-1])
                 # print(f"\n Test: Epoch {e}, Iteration {i}, Loss: {total_loss / valid_data.shape[-1]}, Accuracy: {total_acc / valid_data.shape[-1]} \n")
 
-            
+
 
         with torch.no_grad():
-            param_vector = torch.cat([p.view(-1) for p in model.parameters()])
+            param_vector = torch.cat([p.view(-1) for p in model.parameters() if p.requires_grad])
             # init_vector = torch.cat([p.view(-1) for p in initial_state.values()])
             l2_norm = torch.norm(param_vector, p=2).item()
             l2_distance = torch.norm(param_vector - init_vector, p=2).item()
@@ -317,10 +280,8 @@ def main(args):
             param_distances_l2.append(l2_distance)
             param_norms_l1.append(l1_norm)
             param_distances_l1.append(l1_distance)
-        """
-        sparsity = compute_sparsity(model)
-        sparsity_log.append(sparsity)
-        """
+        
+
         layer_weights = extract_weight_matrices(layer)
         for name, weight_matrix in layer_weights.items():
             layer_matrix_ranks[name].append(compute_norm_effective_rank(weight_matrix))
@@ -384,6 +345,7 @@ def main(args):
             plt.savefig(f"results_post_AdamW/layer_{layer_inspected}_ranks_{args.label}.png", dpi=150)
             plt.close()
 
+            """
             for name, value in layer_matrix_entropy.items():
                 plt.plot(steps, value, label=f"matrix_{name}")
             plt.legend()
@@ -394,18 +356,8 @@ def main(args):
             plt.grid()
             plt.savefig(f"results_post_AdamW/layer_{layer_inspected}_entropy_{args.label}.png", dpi=150)
             plt.close()
+            """
             
-
-            """
-            plt.plot(steps, sparsity_log, label="sparsity")
-            plt.legend()
-            plt.title("Sparsity Over Training")
-            plt.xlabel("Optimization Steps")
-            plt.ylabel("Sparsity")
-            plt.grid()
-            plt.savefig(f"results/sparsity_{args.label}.png", dpi=150)
-            plt.close()
-            """
 
             if args.save_weights:
                 net_its.append(e)
@@ -428,8 +380,8 @@ def main(args):
     if args.save_weights:
         results['net_its'] = net_its
         results['net'] = nets
+        torch.save(results, f"results_post_AdamW/res_{args.label}.pt")
 
-    torch.save(results, f"results_post_AdamW/res_{args.label}.pt")
     # results['steps'] = steps
     # torch.save(results, f"results/res_{args.label}.pt")
     # Plotting L2 norms and distances
@@ -459,7 +411,6 @@ def main(args):
     plt.legend()
     plt.savefig(f"results_post_AdamW/norms_distances_l1_{args.label}.png")
     plt.close()
-        
 
 
 if __name__ == "__main__":

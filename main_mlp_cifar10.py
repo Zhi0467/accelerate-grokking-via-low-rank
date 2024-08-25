@@ -1,6 +1,5 @@
-# modular arithmetic in a 2-layer MLP
-# = high dimensional sparse classification 
-
+import torchvision
+import torchvision.transforms as transforms
 from re import L
 import numpy as np
 import torch
@@ -16,6 +15,7 @@ from model import compute_jacobian
 from model import compute_ntk_batch
 from model import generate_data_without_positional_labels
 from arg_parser import Arg_parser
+
 
 def compute_cosine_similarity(matrix1, matrix2):
     # Flatten the matrices into vectors
@@ -52,41 +52,37 @@ parser = Arg_parser()
 args = parser.return_args()
 
 # Parameters
-p = args.p
-input_dim = 2 * (p)
+input_dim = 32 * 32 * 3
 hidden_dim = args.hidden_dim
-output_dim = p
+output_dim = 10
 scale = args.init_scale
-alpha = args.fraction
 num_epochs = args.num_epochs
+print_interval = int(num_epochs / 500)
 batch_size = args.batch_size
 lr = args.lr
 beta = args.beta
 rank = args.init_rank
-sparse_init = args.sparse_init
-sparsity = args.sparsity
-low_rank_switch = args.low_rank_switch
-switch_to_rank = args.switch_to_rank
 
+# Transform CIFAR-10 images to tensors and normalize them
+transform = transforms.Compose([transforms.ToTensor(),  transforms.Normalize(mean=[0.4914, 0.4822, 0.4465], std=[0.247, 0.243, 0.261]), transforms.Lambda(lambda x: x.view(-1))])
 
-# Generate data and split into training and test sets
-X, y = generate_data_without_positional_labels(p)
-dataset = TensorDataset(torch.tensor(X), torch.tensor(y))
-train_size = int(alpha * len(dataset))
-test_size = len(dataset) - train_size
-train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+# Load CIFAR-10 dataset
+trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
+train_loader = torch.utils.data.DataLoader(trainset, batch_size = batch_size, shuffle=True, num_workers = 2)
+
+testset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform)
+test_loader = torch.utils.data.DataLoader(testset, batch_size = batch_size, shuffle=False, num_workers = 2)
+
 
 # Model, loss function, and optimizer
-model = SimpleMLP(input_dim, hidden_dim, output_dim, scale = scale, rank = rank, sparse_init = sparse_init, sparsity = sparsity).to(device)
+model = SimpleMLP(input_dim, hidden_dim, output_dim, scale, activation='relu', beta = beta, rank = rank).to(device)
 criterion = nn.CrossEntropyLoss()
 optimizer = getattr(torch.optim, args.optimizer)(
         model.parameters(),
         lr=lr,
         weight_decay=args.weight_decay,
     )
-# scheduler = LrScheduler(large_lr=args.lr, regular_lr=args.lr, warmup_steps = 10, cutoff_steps=args.cutoff_steps)
+scheduler = LrScheduler(large_lr=args.lr, regular_lr=args.lr, warmup_steps = 10, cutoff_steps=args.cutoff_steps)
 
 num_singular_values = 8
 
@@ -99,14 +95,7 @@ train_loss = []
 test_loss = []
 train_acc = []
 test_acc = []
-jacobian_norms = []
 
-
-emp_ntks = []
-emp_ntk_similarity_log = []
-emp_ntk_copy = []
-init_emp_ntk = 0
-emp_ntk = 0
 
 layer1_effective_ranks = []
 layer2_effective_ranks = []
@@ -120,6 +109,13 @@ update_ranks_layer2 = []
 update_ranks_from_init_layer1 = []
 update_ranks_from_init_layer2 = []
 
+layer1_rank_init = model.layer1.weight.clone().detach()
+layer2_rank_init = model.layer2.weight.clone().detach()
+
+nfm1_rank = []
+nfm2_rank = []
+nfm1 = []
+nfm2 = []
 
 
 grads = None
@@ -128,21 +124,14 @@ for epoch in range(num_epochs):
     running_loss = 0.0
     running_correct = 0
     total_train = 0
-    jacobian_norm = 0
-    ntk_norm = 0
+
     layer1_rank_pre = model.layer1.weight.clone().detach()
     layer2_rank_pre = model.layer2.weight.clone().detach()
-    jacobian_of_each_batch = []
-    # optimizer.lr = scheduler.step()
 
-    if epoch == args.switch_epoch and args.low_rank_switch:
-        model.initialize_low_rank(switch_to_rank)
-        print(f"SWITCHING WEIGHTS TO RANK {switch_to_rank}.")
+
     
     for inputs, labels in train_loader:
         inputs, labels = inputs.to(device), labels.to(device)  # Move data to GPU
-        # compute the jacobian and ntk
-        jacobian_start = compute_jacobian(model, device, inputs)
 
         # optimization 
         optimizer.zero_grad()
@@ -164,17 +153,13 @@ for epoch in range(num_epochs):
             raise ValueError(f"Invalid update filter type `{args.filter}`")
         
          
+        optimizer.lr = scheduler.step()
         optimizer.step()
         
         running_loss += loss.item() * inputs.size(0)
         _, predicted = torch.max(outputs.data, 1)
         running_correct += (predicted == labels).sum().item()
         total_train += labels.size(0)
-        # jacobian again, for the relative change
-        jacobian_end = compute_jacobian(model, device, inputs)
-        jacobian_change = torch.norm(jacobian_end - jacobian_start) 
-        jacobian_norm += jacobian_change / torch.norm(jacobian_start) * inputs.size(0)
-        jacobian_of_each_batch.append(jacobian_end)
 
         # ntk
         """
@@ -186,33 +171,15 @@ for epoch in range(num_epochs):
     # log the model parameters' update rank
     layer1_update = model.layer1.weight.clone().detach() - layer1_rank_pre
     layer2_update = model.layer2.weight.clone().detach() - layer2_rank_pre
-    layer1_update_from_init = model.layer1.weight.clone().detach() - model.W1
-    layer2_update_from_init = model.layer2.weight.clone().detach() - model.W2
+    layer1_update_from_init = model.layer1.weight.clone().detach() - layer1_rank_init
+    layer2_update_from_init = model.layer2.weight.clone().detach() - layer2_rank_init
 
     update_ranks_layer1.append(compute_norm_effective_rank(layer1_update))
     update_ranks_layer2.append(compute_norm_effective_rank(layer2_update))
     update_ranks_from_init_layer1.append(compute_norm_effective_rank(layer1_update_from_init))
     update_ranks_from_init_layer2.append(compute_norm_effective_rank(layer2_update_from_init))
-
-    jacobian_norms.append(jacobian_norm.item() / total_train)
-    print(f'Epoch {epoch+1}, Norm of Jacobian Change: {jacobian_norm.item() / total_train}')
-    epoch_jacobian = torch.vstack(jacobian_of_each_batch).to(device)
-    emp_ntk = compute_ntk_batch(device, epoch_jacobian)
-    emp_ntk_copy.append(emp_ntk)
-
-    # print(f"the shape of the emp_ntk is {emp_ntk.shape}\n")
-    if epoch == 0:
-        init_emp_ntk = emp_ntk
-
-    emp_ntk_change = torch.norm(emp_ntk - init_emp_ntk, p = 'fro').item()
-    emp_ntk_similarity = compute_cosine_similarity(emp_ntk, init_emp_ntk)
-    emp_ntk_similarity_log.append(emp_ntk_similarity)
-    emp_ntks.append(emp_ntk_change)
-    print(f'Epoch {epoch+1}, emprical NTK change: {emp_ntk_change}')
     
 
-    # print(f'Epoch {epoch+1}, emprical NTK change: {emp_ntk_change}')
-    
     # Compute and log effective ranks of two layers
     layer1_effective_rank = compute_norm_effective_rank(model.layer1.weight)
     layer2_effective_rank = compute_norm_effective_rank(model.layer2.weight)
@@ -224,6 +191,11 @@ for epoch in range(num_epochs):
     layer1_spec_norm.append(layer1_norm)
     layer2_spec_norm.append(layer2_norm)
 
+
+    nfm1_rank.append(compute_norm_effective_rank(model.nfm1))
+    nfm2_rank.append(compute_norm_effective_rank(model.nfm2))
+    nfm1.append(model.nfm1)
+    nfm2.append(model.nfm2)
 
 
     # log the first few significant singular values of the second layer
@@ -258,8 +230,9 @@ for epoch in range(num_epochs):
     epoch_acc = running_correct / total_test
     test_loss.append(epoch_loss)
     test_acc.append(epoch_acc)
-
-    print(f'Epoch {epoch + 1}/{num_epochs}, '
+    
+    if epoch % print_interval == 0:
+      print(f'Epoch {epoch + 1}/{num_epochs}, '
             f'Train Loss: {train_loss[-1]:.4f}, Train Acc: {train_acc[-1]:.2f}, '
             f'Test Loss: {test_loss[-1]:.4f}, Test Acc: {test_acc[-1]:.2f}')
 
@@ -272,33 +245,7 @@ for epoch in range(num_epochs):
     plt.legend()
     plt.grid()
     plt.title('Loss vs Epochs')
-    plt.savefig(f"results_mlp/loss_{args.label}.png")
-    plt.close()
-
-
-    # Plot emprical NTK 
-    fig, ax1 = plt.subplots()
-
-    color = 'tab:blue'
-    ax1.set_xlabel('Epoch')
-    ax1.set_xscale('log', base = 10)  # Set x-axis to log scale
-    ax1.set_ylabel('Accuracy (%)', color=color)
-    ax1.plot(train_acc, label='Train Accuracy', color=color)
-    ax1.plot(test_acc, label='Test Accuracy', linestyle='dashed', color=color)
-    ax1.tick_params(axis='y', labelcolor=color)
-
-    ax2 = ax1.twinx()
-    color = 'tab:red'
-    ax2.set_ylabel('emprical NTK', color=color)
-    ax2.plot(emp_ntks, label='emprical NTK', color=color)
-    ax2.tick_params(axis='y', labelcolor=color)
-
-    # Add legends
-    fig.tight_layout()  # Ensure the right y-label is not slightly clipped
-    fig.legend(loc='upper left')
-
-    plt.title('Accuracy and emprical NTK vs Epochs')
-    plt.savefig(f"results_mlp/emprical_ntk_{args.label}.png")
+    plt.savefig(f"results_mlp_cifar10/loss_{args.label}.png")
     plt.close()
 
 
@@ -325,7 +272,7 @@ for epoch in range(num_epochs):
     fig.legend(loc='upper left')
 
     plt.title('Accuracy and weights update rank vs Epochs')
-    plt.savefig(f"results_mlp/weights_update_rank_{args.label}.png")
+    plt.savefig(f"results_mlp_cifar10/weights_update_rank_{args.label}.png")
     plt.close()
 
     # Plot update rank changes from the init
@@ -351,7 +298,7 @@ for epoch in range(num_epochs):
     fig.legend(loc='upper left')
 
     plt.title('Accuracy and weights update rank vs Epochs')
-    plt.savefig(f"results_mlp/weights_update_rank_from_init_{args.label}.png")
+    plt.savefig(f"results_mlp_cifar10/weights_update_rank_from_init_{args.label}.png")
     plt.close()
     
     # Plot effective ranks
@@ -378,7 +325,7 @@ for epoch in range(num_epochs):
     fig.legend(loc='upper left')
 
     plt.title('Accuracy and Weight Ranks vs Epochs')
-    plt.savefig(f"results_mlp/rank_{args.label}.png")
+    plt.savefig(f"results_mlp_cifar10/rank_{args.label}.png")
     plt.close()
 
     # Plot effective ranks
@@ -405,7 +352,33 @@ for epoch in range(num_epochs):
     fig.legend(loc='upper left')
 
     plt.title('Accuracy and Spectral Norm vs Epochs')
-    plt.savefig(f"results_mlp/spec_norm_{args.label}.png")
+    plt.savefig(f"results_mlp_cifar10/spec_norm_{args.label}.png")
+    plt.close()
+
+    # Plot effective ranks for nfms
+    fig, ax1 = plt.subplots()
+
+    color = 'tab:blue'
+    ax1.set_xlabel('Epoch')
+    ax1.set_xscale('log', base = 10)  # Set x-axis to log scale
+    ax1.set_ylabel('Accuracy (%)', color=color)
+    ax1.plot(train_acc, label='Train Accuracy', color=color)
+    ax1.plot(test_acc, label='Test Accuracy', linestyle='dashed', color=color)
+    ax1.tick_params(axis='y', labelcolor=color)
+
+    ax2 = ax1.twinx()
+    color = 'tab:green'
+    ax2.set_ylabel('NFM effective rank', color=color)
+    ax2.plot(nfm1_rank, label='layer 1', color=color)
+    ax2.plot(nfm2_rank, label='layer 2', linestyle='dashed', color=color)
+    ax2.tick_params(axis='y', labelcolor=color)
+
+    # Add legends
+    fig.tight_layout()  # Ensure the right y-label is not slightly clipped
+    fig.legend(loc='upper left')
+
+    plt.title('Accuracy and NFM rank vs Epochs')
+    plt.savefig(f"results_mlp_cifar10/NFM_rank_{args.label}.png")
     plt.close()
 
 
@@ -437,15 +410,19 @@ for epoch in range(num_epochs):
     fig.legend(loc='upper left')
 
     plt.title('Accuracy and Singular Values vs Epochs')
-    plt.savefig(f"results_mlp/singular_val_{args.label}.png")
+    plt.savefig(f"results_mlp_cifar10/singular_val_{args.label}.png")
     plt.close()
 
-final_emp_ntk = emp_ntk
-emp_ntk_alignment = []
-for epoch in range(num_epochs):
-    emp_ntk_alignment.append(compute_cosine_similarity(emp_ntk_copy[epoch], final_emp_ntk))
+final_nfm1 = model.nfm1
+final_nfm2 = model.nfm2
 
-# Plot NTK alignment
+nfm1_alignment = []
+nfm2_alignment = []
+for epoch in range(num_epochs):
+    nfm1_alignment.append(compute_cosine_similarity(nfm1[epoch], final_nfm1))
+    nfm2_alignment.append(compute_cosine_similarity(nfm2[epoch], final_nfm2))
+
+# Plot nfm alignment
 
 fig, ax1 = plt.subplots()
 
@@ -459,16 +436,15 @@ ax1.tick_params(axis='y', labelcolor=color)
 
 ax2 = ax1.twinx()
 color = 'tab:green'
-ax2.set_ylabel('NTK alignment', color=color)
-ax2.plot(emp_ntk_similarity_log, label='alignment with init', color=color)
-ax2.plot(emp_ntk_alignment, label='alignment with final', linestyle='dashed', color=color)
+ax2.set_ylabel('NFM alignment', color=color)
+ax2.plot(nfm1_alignment, label='layer 1', color=color)
+ax2.plot(nfm2_alignment, label='layer 2', linestyle='dashed', color=color)
 ax2.tick_params(axis='y', labelcolor=color)
 
 # Add legends
 fig.tight_layout()  # Ensure the right y-label is not slightly clipped
 fig.legend(loc='upper left')
 
-plt.title('Accuracy and NTK alignment vs Epochs')
-plt.savefig(f"results_mlp/NTK_alignment_{args.label}.png")
+plt.title('Accuracy and NFM alignment vs Epochs')
+plt.savefig(f"results_mlp_cifar10/NFM_alignment_{args.label}.png")
 plt.close()
-
