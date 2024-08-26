@@ -99,14 +99,15 @@ train_loss = []
 test_loss = []
 train_acc = []
 test_acc = []
+
+"""
 jacobian_norms = []
-
-
 emp_ntks = []
 emp_ntk_similarity_log = []
 emp_ntk_copy = []
 init_emp_ntk = 0
 emp_ntk = 0
+"""
 
 layer1_effective_ranks = []
 layer2_effective_ranks = []
@@ -115,11 +116,12 @@ layer2_spec_norm = []
 layer1_spec_norm_init = torch.linalg.norm(model.layer1.weight, ord = 2).item()
 layer2_spec_norm_init = torch.linalg.norm(model.layer2.weight, ord = 2).item()
 
+"""
 update_ranks_layer1 = []
 update_ranks_layer2 = []
 update_ranks_from_init_layer1 = []
 update_ranks_from_init_layer2 = []
-
+"""
 
 
 grads = None
@@ -128,11 +130,13 @@ for epoch in range(num_epochs):
     running_loss = 0.0
     running_correct = 0
     total_train = 0
+    """
     jacobian_norm = 0
     ntk_norm = 0
     layer1_rank_pre = model.layer1.weight.clone().detach()
     layer2_rank_pre = model.layer2.weight.clone().detach()
     jacobian_of_each_batch = []
+    """
     # optimizer.lr = scheduler.step()
 
     if epoch == args.switch_epoch and args.low_rank_switch:
@@ -142,7 +146,7 @@ for epoch in range(num_epochs):
     for inputs, labels in train_loader:
         inputs, labels = inputs.to(device), labels.to(device)  # Move data to GPU
         # compute the jacobian and ntk
-        jacobian_start = compute_jacobian(model, device, inputs)
+        # jacobian_start = compute_jacobian(model, device, inputs)
 
         # optimization 
         optimizer.zero_grad()
@@ -170,11 +174,12 @@ for epoch in range(num_epochs):
         _, predicted = torch.max(outputs.data, 1)
         running_correct += (predicted == labels).sum().item()
         total_train += labels.size(0)
-        # jacobian again, for the relative change
+        """
         jacobian_end = compute_jacobian(model, device, inputs)
         jacobian_change = torch.norm(jacobian_end - jacobian_start) 
         jacobian_norm += jacobian_change / torch.norm(jacobian_start) * inputs.size(0)
         jacobian_of_each_batch.append(jacobian_end)
+        """
 
         # ntk
         """
@@ -182,7 +187,7 @@ for epoch in range(num_epochs):
         ntk_change = torch.norm(ntk_end - ntk_start)
         ntk_norm += ntk_change / torch.norm(ntk_start) * inputs.size(0)
         """
-    
+    """
     # log the model parameters' update rank
     layer1_update = model.layer1.weight.clone().detach() - layer1_rank_pre
     layer2_update = model.layer2.weight.clone().detach() - layer2_rank_pre
@@ -209,9 +214,7 @@ for epoch in range(num_epochs):
     emp_ntk_similarity_log.append(emp_ntk_similarity)
     emp_ntks.append(emp_ntk_change)
     print(f'Epoch {epoch+1}, emprical NTK change: {emp_ntk_change}')
-    
-
-    # print(f'Epoch {epoch+1}, emprical NTK change: {emp_ntk_change}')
+    """
     
     # Compute and log effective ranks of two layers
     layer1_effective_rank = compute_norm_effective_rank(model.layer1.weight)
@@ -275,7 +278,7 @@ for epoch in range(num_epochs):
     plt.savefig(f"results_mlp/loss_{args.label}.png")
     plt.close()
 
-
+    """
     # Plot emprical NTK 
     fig, ax1 = plt.subplots()
 
@@ -353,7 +356,7 @@ for epoch in range(num_epochs):
     plt.title('Accuracy and weights update rank vs Epochs')
     plt.savefig(f"results_mlp/weights_update_rank_from_init_{args.label}.png")
     plt.close()
-    
+    """
     # Plot effective ranks
     fig, ax1 = plt.subplots()
 
@@ -440,6 +443,7 @@ for epoch in range(num_epochs):
     plt.savefig(f"results_mlp/singular_val_{args.label}.png")
     plt.close()
 
+"""
 final_emp_ntk = emp_ntk
 emp_ntk_alignment = []
 for epoch in range(num_epochs):
@@ -471,4 +475,4 @@ fig.legend(loc='upper left')
 plt.title('Accuracy and NTK alignment vs Epochs')
 plt.savefig(f"results_mlp/NTK_alignment_{args.label}.png")
 plt.close()
-
+"""

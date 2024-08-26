@@ -45,6 +45,7 @@ class Arg_parser():
 
         # for twin-training
         parser.add_argument("--alignment", action='store_true')
+        parser.add_argument("--direction_searching_method", type = str, choices=['srds', 'lrds', 'cbm', 'mbm'], default='lrds')
 
         # for low-rank switch
         parser.add_argument("--low_rank_switch", action='store_true')

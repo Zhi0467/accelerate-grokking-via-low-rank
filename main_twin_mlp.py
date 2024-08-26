@@ -72,7 +72,6 @@ output_dim = p
 scale = args.init_scale
 alpha = args.fraction
 num_epochs = args.num_epochs
-print_interval = int(num_epochs / 100)
 batch_size = args.batch_size
 lr = args.lr
 beta = args.beta
@@ -80,6 +79,12 @@ rank = args.init_rank
 switch_epoch = args.switch_epoch
 aligned = args.alignment
 delta_rank = args.switch_to_rank
+direction_searching_method = args.direction_searching_method
+
+# some hard-coded hyper-params 
+scale_gap = 20.0
+amp_factor = 1.0
+top_k_percent = 5
 
 # Generate data and split into training and test sets
 X, y = generate_data_without_positional_labels(p)
@@ -91,12 +96,12 @@ train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
 # Model, loss function, and optimizer
-aux_model = SimpleMLP(input_dim, hidden_dim, output_dim, scale = scale / 10.0, rank = rank).to(device)
+aux_model = SimpleMLP(input_dim, hidden_dim, output_dim, scale = scale / scale_gap, rank = rank).to(device)
 if aligned:
     model = SimpleMLP(input_dim, hidden_dim, output_dim, scale = scale, rank = rank).to(device)
     model.load_state_dict(aux_model.state_dict())
-    model.layer1.weight.data *= 10.0
-    model.layer2.weight.data *= 10.0
+    model.layer1.weight.data *= scale_gap
+    model.layer2.weight.data *= scale_gap
 else:
     model = SimpleMLP(input_dim, hidden_dim, output_dim, scale, rank = rank).to(device)
 
@@ -113,7 +118,7 @@ aux_optimizer = getattr(torch.optim, args.optimizer)(
     )
 # scheduler = LrScheduler(large_lr=args.lr, regular_lr=args.lr, warmup_steps = 10, cutoff_steps=args.cutoff_steps)
 
-num_singular_values = 8
+num_singular_values = 10
 
 # Initialize a 2D array to store the singular values
 singular_values = np.zeros((num_singular_values, num_epochs))
@@ -124,14 +129,15 @@ train_loss = []
 test_loss = []
 train_acc = []
 test_acc = []
+
+"""
 jacobian_norms = []
-
-
 emp_ntks = []
 emp_ntk_similarity_log = []
 emp_ntk_copy = []
 init_emp_ntk = 0
 emp_ntk = 0
+"""
 
 layer1_effective_ranks = []
 layer2_effective_ranks = []
@@ -140,11 +146,12 @@ layer2_spec_norm = []
 layer1_spec_norm_init = torch.linalg.norm(model.layer1.weight, ord = 2).item()
 layer2_spec_norm_init = torch.linalg.norm(model.layer2.weight, ord = 2).item()
 
+"""
 update_ranks_layer1 = []
 update_ranks_layer2 = []
 update_ranks_from_init_layer1 = []
 update_ranks_from_init_layer2 = []
-
+"""
 
 """
 --------- train aux_model for switch_epoch steps to find an initialization for the main model ------------
@@ -186,16 +193,26 @@ for epoch in range(switch_epoch):
             f'aux test Acc: {epoch_test_acc:.2f}')
         
 print("finished small-init model direction searching.")
-
-delta_w1 = aux_model.layer1.weight.data.clone().detach() - aux_model.W1
-delta_w2 = aux_model.layer2.weight.data.clone().detach() - aux_model.W2
-delta_w1 *= 10.0
-delta_w2 *= 10.0
-delta_w1 = low_rank_approximation(delta_w1, delta_rank)
-delta_w2 = low_rank_approximation(delta_w2, delta_rank)
-
-model.layer1.weight.data += delta_w1
-model.layer2.weight.data += delta_w2
+"""
+------------------------- apply found direction --------------------------
+"""
+if direction_searching_method == 'lrds':
+    delta_w1 = aux_model.layer1.weight.data.clone().detach() - aux_model.W1
+    delta_w2 = aux_model.layer2.weight.data.clone().detach() - aux_model.W2
+    delta_w1 *= scale_gap
+    delta_w2 *= scale_gap
+    delta_w1 = low_rank_approximation(delta_w1, delta_rank)
+    delta_w2 = low_rank_approximation(delta_w2, delta_rank)
+    model.layer1.weight.data += delta_w1
+    model.layer2.weight.data += delta_w2
+elif direction_searching_method == 'srds':
+    model.load_state_dict(aux_model.state_dict())
+    model.layer1.weight.data *= scale_gap
+    model.layer2.weight.data *= scale_gap
+elif direction_searching_method == 'cbm':
+    aux_model.apply_change_based_mask(model, top_k_percent=top_k_percent, amp_factor = amp_factor)
+elif direction_searching_method == 'mbm':
+    aux_model.apply_magnitude_based_mask(model, top_k_percent=top_k_percent, amp_factor = amp_factor)
 
 """
 ----------------------- print the initial accuracy of main before training --------------------------------
@@ -234,17 +251,19 @@ for epoch in range(num_epochs):
     running_loss = 0.0
     running_correct = 0
     total_train = 0
+    """
     jacobian_norm = 0
     ntk_norm = 0
     layer1_rank_pre = model.layer1.weight.clone().detach()
     layer2_rank_pre = model.layer2.weight.clone().detach()
     jacobian_of_each_batch = []
+    """
     # optimizer.lr = scheduler.step()
     
     for inputs, labels in train_loader:
         inputs, labels = inputs.to(device), labels.to(device)  # Move data to GPU
         # compute the jacobian and ntk
-        jacobian_start = compute_jacobian(model, device, inputs)
+        # jacobian_start = compute_jacobian(model, device, inputs)
 
         # optimization 
         optimizer.zero_grad()
@@ -264,7 +283,6 @@ for epoch in range(num_epochs):
             grads = gradfilter_kalman(model, grads=grads, process_noise=args.process_noise, measurement_noise=args.measurement_noise, lamb=args.lamb)
         else:
             raise ValueError(f"Invalid update filter type `{args.filter}`")
-        
 
         optimizer.step()
         
@@ -272,12 +290,15 @@ for epoch in range(num_epochs):
         _, predicted = torch.max(outputs.data, 1)
         running_correct += (predicted == labels).sum().item()
         total_train += labels.size(0)
+        """
         # jacobian again, for the relative change
         jacobian_end = compute_jacobian(model, device, inputs)
         jacobian_change = torch.norm(jacobian_end - jacobian_start) 
         jacobian_norm += jacobian_change / torch.norm(jacobian_start) * inputs.size(0)
         jacobian_of_each_batch.append(jacobian_end)
+        """
     # log the model parameters' update rank
+    """
     layer1_update = model.layer1.weight.clone().detach() - layer1_rank_pre
     layer2_update = model.layer2.weight.clone().detach() - layer2_rank_pre
     layer1_update_from_init = model.layer1.weight.clone().detach() - model.W1
@@ -303,9 +324,7 @@ for epoch in range(num_epochs):
     emp_ntk_similarity_log.append(emp_ntk_similarity)
     emp_ntks.append(emp_ntk_change)
     print(f'Epoch {epoch+1}, emprical NTK change: {emp_ntk_change}')
-    
-
-    # print(f'Epoch {epoch+1}, emprical NTK change: {emp_ntk_change}')
+    """
     
     # Compute and log effective ranks of two layers
     layer1_effective_rank = compute_norm_effective_rank(model.layer1.weight)
@@ -352,10 +371,9 @@ for epoch in range(num_epochs):
     test_loss.append(epoch_loss)
     test_acc.append(epoch_acc)
     
-    if epoch % print_interval == 0:
-      print(f'Epoch {epoch + 1}/{num_epochs}, '
-            f'Train Loss: {train_loss[-1]:.4f}, Train Acc: {train_acc[-1]:.2f}, '
-            f'Test Loss: {test_loss[-1]:.4f}, Test Acc: {test_acc[-1]:.2f}')
+    print(f'Epoch {epoch + 1}/{num_epochs}, '
+          f'Train Loss: {train_loss[-1]:.4f}, Train Acc: {train_acc[-1]:.2f}, '
+          f'Test Loss: {test_loss[-1]:.4f}, Test Acc: {test_acc[-1]:.2f}')
 
     # Plotting
     plt.plot(train_loss, label='Train Loss')
@@ -369,7 +387,7 @@ for epoch in range(num_epochs):
     plt.savefig(f"results_twin_mlp/loss_{args.label}.png")
     plt.close()
 
-
+    """
     # Plot emprical NTK 
     fig, ax1 = plt.subplots()
 
@@ -447,6 +465,7 @@ for epoch in range(num_epochs):
     plt.title('Accuracy and weights update rank vs Epochs')
     plt.savefig(f"results_twin_mlp/weights_update_rank_from_init_{args.label}.png")
     plt.close()
+    """
     
     # Plot effective ranks
     fig, ax1 = plt.subplots()
@@ -459,7 +478,6 @@ for epoch in range(num_epochs):
     ax1.plot(test_acc, label='Test Accuracy', linestyle='dashed', color=color)
     ax1.tick_params(axis='y', labelcolor=color)
 
-    # Create a second y-axis for the Jacobian norms
     ax2 = ax1.twinx()
     color = 'tab:green'
     ax2.set_ylabel('effective ranks', color=color)
@@ -534,6 +552,7 @@ for epoch in range(num_epochs):
     plt.savefig(f"results_twin_mlp/singular_val_{args.label}.png")
     plt.close()
 
+"""
 final_emp_ntk = emp_ntk
 
 emp_ntk_alignment = []
@@ -567,3 +586,4 @@ fig.legend(loc='upper left')
 plt.title('Accuracy and NTK alignment vs Epochs')
 plt.savefig(f"results_twin_mlp/NTK_alignment_{args.label}.png")
 plt.close()
+"""

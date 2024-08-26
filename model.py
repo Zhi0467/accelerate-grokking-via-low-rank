@@ -230,11 +230,72 @@ class SimpleMLP(nn.Module):
     def random_sparse_mask(self, sparsity = 0.8):
         self.random_sparse_mask_layer(self.layer1, sparsity)
         self.random_sparse_mask_layer(self.layer2, sparsity)
+
     def to(self, device):
         super(SimpleMLP, self).to(device)
         self.W1 = self.W1.to(device)
         self.W2 = self.W2.to(device)
         return self
+    
+    def get_weight_changes(self):
+        # Calculate absolute changes in weights
+        W1_change = torch.abs(self.layer1.weight.data.clone().detach() - self.W1)
+        W2_change = torch.abs(self.layer2.weight.data.clone().detach() - self.W2)
+        return W1_change, W2_change
+
+    def apply_change_based_mask(self, main_model, top_k_percent=10, amp_factor = 2.0):
+        W1_change, W2_change = self.get_weight_changes()
+
+        # Flatten the changes and sort by magnitude
+        W1_flat = W1_change.view(-1)
+        W2_flat = W2_change.view(-1)
+        
+        # Determine threshold based on top_k_percent
+        k1 = int(top_k_percent / 100.0 * W1_flat.numel())
+        k2 = int(top_k_percent / 100.0 * W2_flat.numel())
+        
+        threshold_W1 = torch.topk(W1_flat, k1, sorted=False).values.min()
+        threshold_W2 = torch.topk(W2_flat, k2, sorted=False).values.min()
+        
+        # Create masks
+        mask_W1 = (W1_change >= threshold_W1).float()
+        mask_W2 = (W2_change >= threshold_W2).float()
+        
+        # Apply masks to the main model
+        with torch.no_grad():
+            main_model.layer1.weight.data.mul_(mask_W1)
+            main_model.layer2.weight.data.mul_(mask_W2)
+            main_model.layer1.weight.data *= amp_factor
+            main_model.layer2.weight.data *= amp_factor
+
+        print("Applied change-based mask to main model.")
+    
+    def apply_magnitude_based_mask(self, main_model, top_k_percent = 10, amp_factor = 2.0):
+        W1_abs = torch.abs(self.layer1.weight.data.clone().detach())
+        W2_abs = torch.abs(self.layer2.weight.data.clone().detach())
+
+        W1_flat = W1_abs.view(-1)
+        W2_flat = W2_abs.view(-1)
+        
+        # Determine threshold based on top_k_percent
+        k1 = int(top_k_percent / 100.0 * W1_flat.numel())
+        k2 = int(top_k_percent / 100.0 * W2_flat.numel())
+        
+        threshold_W1 = torch.topk(W1_flat, k1, sorted=False).values.min()
+        threshold_W2 = torch.topk(W2_flat, k2, sorted=False).values.min()
+        
+        # Create masks
+        mask_W1 = (W1_abs >= threshold_W1).float()
+        mask_W2 = (W2_abs >= threshold_W2).float()
+        
+        # Apply masks to the main model
+        with torch.no_grad():
+            main_model.layer1.weight.data.mul_(mask_W1)
+            main_model.layer2.weight.data.mul_(mask_W2)
+            main_model.layer1.weight.data *= amp_factor
+            main_model.layer2.weight.data *= amp_factor
+
+        print("Applied magnitude-based mask to main model.")
         
 
 class SimpleMLP_LoRA(nn.Module):
