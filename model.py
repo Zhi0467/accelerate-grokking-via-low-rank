@@ -83,7 +83,7 @@ class Block(nn.Module):
 
         if rank is not None:
             print(f"using rank {rank} initialization.")
-            self.value_matrix.data = self.low_rank_approximation(self.value_matrix.data, rank)
+            self.attn.in_proj_weight.data = self.low_rank_approximation(self.attn.in_proj_weight.data, rank)
             self.attn.out_proj.weight.data = self.low_rank_approximation(self.attn.out_proj.weight.data, rank)
             self.mlp[0].weight.data = self.low_rank_approximation(self.mlp[0].weight.data, rank)
             self.mlp[2].weight.data = self.low_rank_approximation(self.mlp[2].weight.data, rank)
@@ -118,12 +118,26 @@ class Block(nn.Module):
     def low_rank_approximation(self, matrix, rank):
         # Perform SVD on the attention weights matrix
         U, S, V = torch.svd(matrix)
+        
+        # Compute the sum of all singular values (original nuclear norm)
+        original_nuclear_norm = S.sum()
+        
         # Retain only the top 'rank' singular values
-        S = torch.diag(S[:rank])
+        S_reduced = S[:rank]
         U = U[:, :rank]
         V = V[:, :rank]
-        # Recompose the matrix with reduced rank
-        low_rank_matrix = torch.mm(U, torch.mm(S, V.t()))
+        
+        # Compute the sum of the reduced singular values (current nuclear norm)
+        reduced_nuclear_norm = S_reduced.sum()
+        
+        # Scale the reduced singular values to preserve the original nuclear norm
+        scaling_factor = original_nuclear_norm / reduced_nuclear_norm
+        S_reduced = S_reduced * scaling_factor
+        
+        # Recompose the matrix with the scaled singular values
+        S_reduced = torch.diag(S_reduced)
+        low_rank_matrix = torch.mm(U, torch.mm(S_reduced, V.t()))
+        
         return low_rank_matrix
 
     def sparse_mask_on_attn(self, sparsity_level = 0.9):
@@ -184,12 +198,26 @@ class Decoder(nn.Module):
     def low_rank_approximation(self, matrix, rank):
         # Perform SVD on the attention weights matrix
         U, S, V = torch.svd(matrix)
+        
+        # Compute the sum of all singular values (original nuclear norm)
+        original_nuclear_norm = S.sum()
+        
         # Retain only the top 'rank' singular values
-        S = torch.diag(S[:rank])
+        S_reduced = S[:rank]
         U = U[:, :rank]
         V = V[:, :rank]
-        # Recompose the matrix with reduced rank
-        low_rank_matrix = torch.mm(U, torch.mm(S, V.t()))
+        
+        # Compute the sum of the reduced singular values (current nuclear norm)
+        reduced_nuclear_norm = S_reduced.sum()
+        
+        # Scale the reduced singular values to preserve the original nuclear norm
+        scaling_factor = original_nuclear_norm / reduced_nuclear_norm
+        S_reduced = S_reduced * scaling_factor
+        
+        # Recompose the matrix with the scaled singular values
+        S_reduced = torch.diag(S_reduced)
+        low_rank_matrix = torch.mm(U, torch.mm(S_reduced, V.t()))
+        
         return low_rank_matrix
 
 
@@ -238,8 +266,10 @@ class SimpleMLP(nn.Module):
             pass
 
         if rank is not None:
-            print(f"set init rank to be {rank}.")
+            # print(f"set init rank to be {rank}.")
             self.initialize_low_rank(rank)
+
+        # self.reduce_spectral_norm_keep_nuclear_norm(order = 50)
 
         self.W1 = self.layer1.weight.data.clone().detach()
         self.W2 = self.layer2.weight.data.clone().detach()
@@ -263,23 +293,59 @@ class SimpleMLP(nn.Module):
         # Get the weight matrix of the layer
         weight = layer.weight.data
 
-        # Perform SVD on the weight matrix
+        # Perform SVD on the attention weights matrix
         U, S, V = torch.svd(weight)
-
+        
         # Retain only the top 'rank' singular values
-        S = torch.diag(S[:rank])
+        S_reduced = S[:rank]
         U = U[:, :rank]
         V = V[:, :rank]
-
-        # Recompose the weight matrix with reduced rank
-        low_rank_weight = torch.mm(U, torch.mm(S, V.t()))
-
+        
+        S_reduced = S_reduced * 2.0
+        
+        # Recompose the matrix with the scaled singular values
+        S_reduced = torch.diag(S_reduced)
+        low_rank_weight = torch.mm(U, torch.mm(S_reduced, V.t()))
+        
         # Set the layer's weight to the low-rank approximation
         layer.weight.data = low_rank_weight
+
+    def spectral_norm_reduction_with_averaging(self, layer, order):
+        """
+        Reduces the spectral norm of a matrix using pairwise averaging of singular values,
+        while preserving the nuclear norm.
+        """
+        # Perform SVD on the input matrix
+        matrix = layer.weight.data
+        U, S, V = torch.svd(matrix)
+        print("Original Spectral Norm:", torch.svd(matrix).S[0])
+        print("Original Nuclear Norm:", torch.svd(matrix).S.sum())
+        average = 0.0
+        for i in range(len(S) - 1):
+            average += S[i]
+        average /= len(S)
+    
+        # Pairwise average the singular values to reduce the largest one
+        for i in range(len(S) - 1):
+            S[i] = average
+    
+        # Recompose the matrix with the adjusted singular values
+        adjusted_matrix = U @ torch.diag(S) @ V.t()
+
+        print("Adjusted Spectral Norm (Averaging):", torch.svd(adjusted_matrix).S[0])
+        print("Adjusted Nuclear Norm (Averaging):", torch.svd(adjusted_matrix).S.sum())
+    
+        layer.weight.data = adjusted_matrix
+    
     
     def initialize_low_rank(self, rank):
         self.initialize_low_rank_layer(self.layer1, rank)
         self.initialize_low_rank_layer(self.layer2, rank)
+
+    def reduce_spectral_norm_keep_nuclear_norm(self, order):
+        self.spectral_norm_reduction_with_averaging(self.layer1, order)
+        self.spectral_norm_reduction_with_averaging(self.layer2, order)
+        
     
     def random_sparse_mask_layer(self, layer, sparsity_level):
         # Get the number of parameters in the layer
@@ -423,6 +489,11 @@ class SimpleMLP_LoRA(nn.Module):
         self.A2 = nn.Parameter(torch.zeros(hidden_dim, rank))
         self.B2 = nn.Parameter(torch.randn(rank, output_dim))
 
+        W1 = self.layer1.weight.t() + torch.matmul(self.A1, self.B1)
+        W1.data *= scale
+        W2 = self.layer2.weight.t() + torch.matmul(self.A2, self.B2)
+        W2.data *= scale
+
         if init_rank is not None:
           print(f"set init rank to be {init_rank}.")
           self.initialize_low_rank(self.layer1, init_rank)
@@ -448,20 +519,20 @@ class SimpleMLP_LoRA(nn.Module):
           x = torch.matmul(x, W2)
           self.nfm1 = torch.mm(self.effective_weights1.data.t(), self.effective_weights1.data)
           self.nfm2 = torch.mm(self.effective_weights2.data.t(), self.effective_weights2.data)
-          return x * self.scale  # Scale the final output
+          return x  # Scale the final output
         elif self.epoch == self.switch_epoch:
           self.switch()
           x = self.layer1(x)
           x = x**2
           x = self.layer2(x)
           self.update_nfm_and_effective_weights()
-          return x * self.scale  # Scale the final output
+          return x # Scale the final output
         else:
           x = self.layer1(x)
           x = x**2
           x = self.layer2(x)
           self.update_nfm_and_effective_weights()
-          return x * self.scale  # Scale the final output
+          return x  # Scale the final output
 
     def update_nfm_and_effective_weights(self):
         self.effective_weights1 = self.layer1.weight.clone().detach()
@@ -492,17 +563,28 @@ class SimpleMLP_LoRA(nn.Module):
         # Get the weight matrix of the layer
         weight = layer.weight.data
 
-        # Perform SVD on the weight matrix
+        # Perform SVD on the attention weights matrix
         U, S, V = torch.svd(weight)
-
+        
+        # Compute the sum of all singular values (original nuclear norm)
+        original_nuclear_norm = S.sum()
+        
         # Retain only the top 'rank' singular values
-        S = torch.diag(S[:rank])
+        S_reduced = S[:rank]
         U = U[:, :rank]
         V = V[:, :rank]
-
-        # Recompose the weight matrix with reduced rank
-        low_rank_weight = torch.mm(U, torch.mm(S, V.t()))
-
+        
+        # Compute the sum of the reduced singular values (current nuclear norm)
+        reduced_nuclear_norm = S_reduced.sum()
+        
+        # Scale the reduced singular values to preserve the original nuclear norm
+        scaling_factor = original_nuclear_norm / reduced_nuclear_norm
+        S_reduced = S_reduced * scaling_factor
+        
+        # Recompose the matrix with the scaled singular values
+        S_reduced = torch.diag(S_reduced)
+        low_rank_weight = torch.mm(U, torch.mm(S_reduced, V.t()))
+        
         # Set the layer's weight to the low-rank approximation
         layer.weight.data = low_rank_weight
 

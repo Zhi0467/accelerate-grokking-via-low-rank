@@ -3,22 +3,6 @@ import subprocess
 # This script allows multiple runs at once.
 main_configs = [
 {
-        "label": "1",
-        "filter": "none",
-        "optimizer": "AdamW",
-        "budget": 200000,
-        "p": 113,
-        "weight_decay": 0.1,
-        "alpha": 0.95,
-        "lamb": 2.0,
-        "batch_size": 2048,
-        "lr": 4e-3,
-        "lambda_nuc": 0,
-        "lambda_rank": 0,
-        "save_weights": False,
-        "enable_lr_update": False,
-},
-{
         "label": "2",
         "filter": "none",
         "optimizer": "AdamW",

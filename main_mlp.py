@@ -80,7 +80,7 @@ update_rank_percentage = args.update_rank_percentage
 
 
 # Generate data and split into training and test sets
-X, y = generate_data(p, 'add')
+X, y = generate_data(p, 'mul')
 dataset = TensorDataset(torch.tensor(X), torch.tensor(y))
 train_size = int(alpha * len(dataset))
 test_size = len(dataset) - train_size

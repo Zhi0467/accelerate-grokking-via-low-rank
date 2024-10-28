@@ -10,11 +10,7 @@ import torch.optim as optim
 import matplotlib.pyplot as plt
 from grokfast import *
 from optimizers import * 
-from model import SimpleMLP
-from model import compute_jacobian
-from model import compute_ntk_batch
-from model import generate_data_without_positional_labels
-from model import SimpleMLP_LoRA
+from model import *
 from arg_parser import Arg_parser
 
 def compute_norm_effective_rank(weight_matrix):
@@ -69,7 +65,7 @@ beta = args.beta
 init_rank = args.init_rank
 
 # Generate data and split into training and test sets
-X, y = generate_data_without_positional_labels(p)
+X, y = generate_data(p, 'mul')
 dataset = TensorDataset(torch.tensor(X), torch.tensor(y))
 train_size = int(alpha * len(dataset))
 test_size = len(dataset) - train_size
@@ -78,7 +74,7 @@ train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
 # Model, loss function, and optimizer
-model = SimpleMLP_LoRA(input_dim, hidden_dim, output_dim, scale, rank= LoRA_rank, switch_epoch = switch_epoch, beta = beta, init_rank = init_rank).to(device)
+model = SimpleMLP_LoRA(input_dim, hidden_dim, output_dim, scale, rank= LoRA_rank, switch_epoch = args.num_epochs + 1, beta = beta, init_rank = init_rank).to(device)
 criterion = nn.CrossEntropyLoss()
 optimizer = getattr(torch.optim, args.optimizer)(
         model.parameters(),
@@ -86,7 +82,6 @@ optimizer = getattr(torch.optim, args.optimizer)(
         weight_decay=args.weight_decay,
         betas=(args.beta1, args.beta2),
     )
-scheduler = LrScheduler(large_lr=args.large_lr, regular_lr=args.lr, warmup_steps = 10, cutoff_steps=args.cutoff_steps)
 
 num_singular_values = 8
 
@@ -98,10 +93,8 @@ train_loss = []
 test_loss = []
 train_acc = []
 test_acc = []
-jacobian_norms = []
 
-emp_ntks = []
-init_emp_ntk = 0
+
 layer1_effective_ranks = []
 layer2_effective_ranks = []
 
@@ -116,20 +109,15 @@ for epoch in range(num_epochs):
     running_loss = 0.0
     running_correct = 0
     total_train = 0
-    jacobian_norm = 0
-    emp_ntk = 0 
-    optimizer.lr = scheduler.step()
     
     
     for inputs, labels in train_loader:
         inputs, labels = inputs.to(device), labels.to(device)  # Move data to GPU
-        # compute the jacobian and ntk
-        jacobian_start = compute_jacobian(model, device, inputs)
 
         # optimization 
         optimizer.zero_grad()
         outputs = model(inputs)
-        loss = criterion(outputs, labels) / float(scale**2)
+        loss = criterion(outputs, labels)
         loss.backward()
 
         if args.filter == "none":
@@ -158,14 +146,6 @@ for epoch in range(num_epochs):
         _, predicted = torch.max(outputs.data, 1)
         running_correct += (predicted == labels).sum().item()
         total_train += labels.size(0)
-        # jacobian again, for the relative change
-        jacobian_end = compute_jacobian(model, device, inputs)
-        jacobian_change = torch.norm(jacobian_end - jacobian_start) 
-        jacobian_norm += jacobian_change / torch.norm(jacobian_start) * inputs.size(0)
-
-        ntk_batch = compute_ntk_batch(model, device, inputs)
-        emp_ntk += ntk_batch * inputs.size(0)
-
 
 
     """
@@ -174,17 +154,7 @@ for epoch in range(num_epochs):
     """  
 
     model.epoch += 1
-    jacobian_norms.append(jacobian_norm.item() / total_train)
-    print(f'Epoch {epoch+1}, Norm of Jacobian Change: {jacobian_norm.item() / total_train}')
-    emp_ntk = emp_ntk / total_train
 
-    # print(f"the shape of the emp_ntk is {emp_ntk.shape}\n")
-    if epoch == 0:
-        init_emp_ntk = emp_ntk
-
-    emp_ntk_change = torch.norm(emp_ntk - init_emp_ntk, p = 'fro').item()
-    emp_ntks.append(emp_ntk_change)
-    print(f'Epoch {epoch+1}, emprical NTK change: {emp_ntk_change}')
     
     # Compute and log effective ranks of two layers
     layer1_effective_rank = compute_norm_effective_rank(model.effective_weights1)
@@ -216,7 +186,7 @@ for epoch in range(num_epochs):
         for inputs, labels in test_loader:
             inputs, labels = inputs.to(device), labels.to(device)  # Move data to GPU
             outputs = model(inputs)
-            loss = criterion(outputs, labels) / float(scale**2)
+            loss = criterion(outputs, labels)
             running_loss += loss.item() * inputs.size(0)
             _, predicted = torch.max(outputs.data, 1)
             running_correct += (predicted == labels).sum().item()
@@ -249,59 +219,6 @@ for epoch in range(num_epochs):
     plt.savefig(f"results_mlp_LoRA/loss_{args.label}.png")
     plt.close()
 
-
-    # Plot train, test accuracy, and Jacobian
-    fig, ax1 = plt.subplots()
-
-    color = 'tab:blue'
-    ax1.set_xlabel('Epoch')
-    ax1.set_xscale('log', base = 10)  # Set x-axis to log scale
-    ax1.set_ylabel('Accuracy (%)', color=color)
-    ax1.plot(train_acc, label='Train Accuracy', color=color)
-    ax1.plot(test_acc, label='Test Accuracy', linestyle='dashed', color=color)
-    ax1.tick_params(axis='y', labelcolor=color)
-
-    # Create a second y-axis for the Jacobian norms
-    ax2 = ax1.twinx()
-    color = 'tab:red'
-    ax2.set_ylabel('Jacobian Norm', color=color)
-    ax2.plot(jacobian_norms, label='Jacobian relative change', color=color)
-    ax2.tick_params(axis='y', labelcolor=color)
-
-    # Add legends
-    fig.tight_layout()  # Ensure the right y-label is not slightly clipped
-    fig.legend(loc='upper left')
-
-    plt.title('Accuracy and Jacobian Norm vs Epochs')
-    plt.savefig(f"results_mlp_LoRA/acc_jacobian_{args.label}.png")
-    plt.close()
-
-
-    # Plot emprical NTK 
-    fig, ax1 = plt.subplots()
-
-    color = 'tab:blue'
-    ax1.set_xlabel('Epoch')
-    ax1.set_xscale('log', base = 10)  # Set x-axis to log scale
-    ax1.set_ylabel('Accuracy (%)', color=color)
-    ax1.plot(train_acc, label='Train Accuracy', color=color)
-    ax1.plot(test_acc, label='Test Accuracy', linestyle='dashed', color=color)
-    ax1.tick_params(axis='y', labelcolor=color)
-
-    # Create a second y-axis for the Jacobian norms
-    ax2 = ax1.twinx()
-    color = 'tab:red'
-    ax2.set_ylabel('emprical NTK', color=color)
-    ax2.plot(emp_ntks, label='emprical NTK', color=color)
-    ax2.tick_params(axis='y', labelcolor=color)
-
-    # Add legends
-    fig.tight_layout()  # Ensure the right y-label is not slightly clipped
-    fig.legend(loc='upper left')
-
-    plt.title('Accuracy and emprical NTK vs Epochs')
-    plt.savefig(f"results_mlp_LoRA/emprical_ntk_{args.label}.png")
-    plt.close()
     
     # Plot effective ranks
     fig, ax1 = plt.subplots()
