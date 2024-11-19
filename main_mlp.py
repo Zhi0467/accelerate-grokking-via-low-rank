@@ -14,47 +14,6 @@ from optimizers import *
 from model import *
 from arg_parser import Arg_parser
 from tools import *
-
-def compute_cosine_similarity(matrix1, matrix2):
-    # Flatten the matrices into vectors
-    vec1 = matrix1.view(-1)
-    vec2 = matrix2.view(-1)
-    
-    # Compute the dot product of the two vectors
-    dot_product = torch.dot(vec1, vec2)
-    
-    # Compute the magnitude (Euclidean norm) of each vector
-    magnitude_vec1 = torch.norm(vec1)
-    magnitude_vec2 = torch.norm(vec2)
-    
-    # Compute the cosine similarity
-    cosine_sim = dot_product / (magnitude_vec1 * magnitude_vec2)
-    
-    return cosine_sim.item()  # Convert to a Python float for readability
-
-def compute_norm_effective_rank(weight_matrix):
-    # Compute SVD
-    U, S, V = torch.svd(weight_matrix)
-    # Normalize singular values
-    S_normalized = S / S.sum()
-    # Compute Shannon entropy
-    entropy = -(S_normalized * torch.log(S_normalized)).sum()
-    # Compute effective rank
-    effective_rank = torch.exp(entropy)
-    rank = torch.linalg.matrix_rank(weight_matrix)
-    effective_rank = effective_rank / rank
-    return effective_rank.item()
-
-def low_rank_approximation(matrix, rank):
-        # Perform SVD on the attention weights matrix
-        U, S, V = torch.svd(matrix)
-        # Retain only the top 'rank' singular values
-        S = torch.diag(S[:rank])
-        U = U[:, :rank]
-        V = V[:, :rank]
-        # Recompose the matrix with reduced rank
-        low_rank_matrix = torch.mm(U, torch.mm(S, V.t()))
-        return low_rank_matrix
     
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 parser = Arg_parser()
@@ -64,7 +23,6 @@ args = parser.return_args()
 p = args.p
 input_dim = 2 * (p)
 hidden_dim = args.hidden_dim
-output_dim = p
 scale = args.init_scale
 alpha = args.fraction
 num_epochs = args.num_epochs
@@ -77,9 +35,12 @@ sparsity = args.sparsity
 low_rank_switch = args.low_rank_switch
 switch_to_rank = args.switch_to_rank
 update_rank_percentage = args.update_rank_percentage
+num_XOR_samples = 128
 
 
-# Generate data and split into training and test sets
+# uncomment to: Generate modular data and split into training and test sets
+"""
+output_dim = p
 X, y = generate_data(p, 'mul')
 dataset = TensorDataset(torch.tensor(X), torch.tensor(y))
 train_size = int(alpha * len(dataset))
@@ -87,10 +48,24 @@ test_size = len(dataset) - train_size
 train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+criterion = nn.CrossEntropyLoss()
+"""
+
+# un-comment the following code block if running on XOR data
+# also uncomment the outputs = outputs.squeeze(1) in training loop
+output_dim = 1
+X_clean, X_noise, y_clean, y_noise = generate_XOR_data(num_XOR_samples, input_dim)
+y_clean = (y_clean + 1) / 2
+y_noise = (y_noise + 1) / 2
+train_dataset = TensorDataset(torch.tensor(X_noise), torch.tensor(y_noise))
+test_dataset = TensorDataset(torch.tensor(X_clean), torch.tensor(y_clean))
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+criterion = nn.BCEWithLogitsLoss()
 
 # Model, loss function, and optimizer
-model = SimpleMLP(input_dim, hidden_dim, output_dim, scale = scale, rank = rank, sparse_init = sparse_init, sparsity = sparsity).to(device)
-criterion = nn.CrossEntropyLoss()
+model = SimpleMLP(input_dim, hidden_dim, output_dim, scale = scale, activation = "relu", rank = rank, sparse_init = sparse_init, sparsity = sparsity).to(device)
+
 if args.optimizer == 'AdamW' or args.optimizer == 'Adam':
     optimizer = getattr(torch.optim, args.optimizer)(
             model.parameters(),
@@ -174,6 +149,8 @@ for epoch in range(num_epochs):
         # optimization 
         optimizer.zero_grad()
         outputs = model(inputs)
+        # need to uncomment this to run XOR data
+        outputs = outputs.squeeze(1)
         loss = criterion(outputs, labels)
         loss.backward()
 
@@ -206,7 +183,9 @@ for epoch in range(num_epochs):
         optimizer.step()
         
         running_loss += loss.item() * inputs.size(0)
-        _, predicted = torch.max(outputs.data, 1)
+        # _, predicted = torch.max(outputs.data, 1)
+        # need to uncomment the following line for XOR
+        predicted = (outputs >= 0).float()
         running_correct += (predicted == labels).sum().item()
         total_train += labels.size(0)
         """
@@ -286,9 +265,13 @@ for epoch in range(num_epochs):
         for inputs, labels in test_loader:
             inputs, labels = inputs.to(device), labels.to(device)  # Move data to GPU
             outputs = model(inputs)
+            # need to uncomment this to run XOR data
+            outputs = outputs.squeeze(1)
             loss = criterion(outputs, labels)
             running_loss += loss.item() * inputs.size(0)
-            _, predicted = torch.max(outputs.data, 1)
+            # _, predicted = torch.max(outputs.data, 1)
+            # need to uncomment the following line for XOR
+            predicted = (outputs >= 0).float()
             running_correct += (predicted == labels).sum().item()
             total_test += labels.size(0)
     

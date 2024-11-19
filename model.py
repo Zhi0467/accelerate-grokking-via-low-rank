@@ -472,67 +472,44 @@ class SimpleMLP_LoRA(nn.Module):
         if beta is not None:
           self.layer1.weight.data *= beta
 
-        self.epoch = 0
-        self.switch_epoch = switch_epoch
-
         # Freeze the original weights initially
         for param in self.layer1.parameters():
             param.requires_grad = False
         for param in self.layer2.parameters():
             param.requires_grad = False
 
-        # Initialize low-rank matrices for fc1
-        self.A1 = nn.Parameter(torch.zeros(input_dim, rank))
-        self.B1 = nn.Parameter(torch.randn(rank, hidden_dim))
+        self.A1, self.B1 = self.spectral_initialize(self.layer1, rank)
+        self.A2, self.B2 = self.spectral_initialize(self.layer2, rank)
+        # Register the low-rank matrices as trainable parameters
+        self.A1 = nn.Parameter(self.A1)
+        self.B1 = nn.Parameter(self.B1)
+        self.A2 = nn.Parameter(self.A2)
+        self.B2 = nn.Parameter(self.B2)
 
-        # Initialize low-rank matrices for fc2
-        self.A2 = nn.Parameter(torch.zeros(hidden_dim, rank))
-        self.B2 = nn.Parameter(torch.randn(rank, output_dim))
-
-        W1 = self.layer1.weight.t() + torch.matmul(self.A1, self.B1)
+        W1 = torch.matmul(self.A1, self.B1)
         W1.data *= scale
-        W2 = self.layer2.weight.t() + torch.matmul(self.A2, self.B2)
+        W2 = torch.matmul(self.A2, self.B2)
         W2.data *= scale
 
-        if init_rank is not None:
-          print(f"set init rank to be {init_rank}.")
-          self.initialize_low_rank(self.layer1, init_rank)
-          self.initialize_low_rank(self.layer2, init_rank)
-
-        self.effective_weights1 = self.layer1.weight.clone().detach()
-        self.effective_weights2 = self.layer2.weight.clone().detach()
+        self.effective_weights1 = W1.t()
+        self.effective_weights2 = W2.t()
         self.nfm1 = torch.mm(self.effective_weights1.data.t(), self.effective_weights1.data)
         self.nfm2 = torch.mm(self.effective_weights2.data.t(), self.effective_weights2.data)
 
 
     def forward(self, x):
-        # First layer with low-rank adaptation
-        if self.epoch < self.switch_epoch:
-          W1 = self.layer1.weight.t() + torch.matmul(self.A1, self.B1)
-          self.effective_weights1 = W1.t()
-          x = torch.matmul(x, W1)
-          x = x**2
+        W1 = torch.matmul(self.A1, self.B1)
+        self.effective_weights1 = W1.t()
+        x = torch.matmul(x, self.effective_weights1)
+        x = x**2
 
-          # Second layer with low-rank adaptation
-          W2 = self.layer2.weight.t() + torch.matmul(self.A2, self.B2)
-          self.effective_weights2 = W2.t()
-          x = torch.matmul(x, W2)
-          self.nfm1 = torch.mm(self.effective_weights1.data.t(), self.effective_weights1.data)
-          self.nfm2 = torch.mm(self.effective_weights2.data.t(), self.effective_weights2.data)
-          return x  # Scale the final output
-        elif self.epoch == self.switch_epoch:
-          self.switch()
-          x = self.layer1(x)
-          x = x**2
-          x = self.layer2(x)
-          self.update_nfm_and_effective_weights()
-          return x # Scale the final output
-        else:
-          x = self.layer1(x)
-          x = x**2
-          x = self.layer2(x)
-          self.update_nfm_and_effective_weights()
-          return x  # Scale the final output
+        W2 = torch.matmul(self.A2, self.B2)
+        self.effective_weights2 = W2.t()
+        x = torch.matmul(x, self.effective_weights2)
+        self.nfm1 = torch.mm(self.effective_weights1.data.t(), self.effective_weights1.data)
+        self.nfm2 = torch.mm(self.effective_weights2.data.t(), self.effective_weights2.data)
+        return x  # Scale the final output
+
 
     def update_nfm_and_effective_weights(self):
         self.effective_weights1 = self.layer1.weight.clone().detach()
@@ -540,6 +517,7 @@ class SimpleMLP_LoRA(nn.Module):
         self.nfm1 = torch.mm(self.effective_weights1.data.t(), self.effective_weights1.data)
         self.nfm2 = torch.mm(self.effective_weights2.data.t(), self.effective_weights2.data)
 
+    """
     def switch(self):
         # Unfreeze the original weights initially
         # switch to normal full parameters training
@@ -587,6 +565,27 @@ class SimpleMLP_LoRA(nn.Module):
         
         # Set the layer's weight to the low-rank approximation
         layer.weight.data = low_rank_weight
+    """
+
+    def spectral_initialize(self, layer, rank):
+        # Get the weight matrix of the layer
+        weight = layer.weight.data
+        # Perform SVD on the attention weights matrix
+        U, S, V = torch.svd(weight)
+        # Select the top 'rank' components
+        U = U[:, :rank]
+        V = V[:, :rank]
+        S = S[:rank]
+
+        # Compute square roots of singular values
+        sqrt_S = torch.diag(S.sqrt())
+
+        # Compute U * sqrt(S) and sqrt(S) * V^T
+        U_sqrt_S = U @ sqrt_S
+        sqrt_S_V = sqrt_S @ V.T
+
+        return U_sqrt_S, sqrt_S_V
+
 
 
 
@@ -696,3 +695,72 @@ def compute_ntk_batch(device, jacobian):
     
     return ntk_batch
 
+def generate_orthogonal_vectors(p, seed=42):
+    np.random.seed(seed)  # Set the random seed for reproducibility
+    # Generate a random vector for mu1
+    mu1 = np.random.randn(p)
+    mu1 = mu1 / np.linalg.norm(mu1)  # Normalize to unit length
+
+    # Generate a random vector for mu2 orthogonal to mu1
+    mu2 = np.random.randn(p)
+    mu2 = mu2 - mu2.dot(mu1) * mu1  # Remove component in direction of mu1
+    mu2 = mu2 / np.linalg.norm(mu2)  # Normalize to unit length
+
+    mu1 *= 10.0
+    mu2 *= 10.0
+
+    return mu1, mu2
+
+def generate_XOR_data(n_samples, p, eta=0.05, seed = 42):
+    """
+    Parameters:
+    - n_samples: Number of samples to generate.
+    - p: Dimension of the feature space (R^p).
+    - mu1: Mean vector for the first cluster (shape: [p]).
+    - mu2: Mean vector for the second cluster (shape: [p]).
+    - eta: Label flipping probability (0 <= eta < 0.5).
+
+    Returns:
+    - X: Generated data points (shape: [n_samples, p]).
+    - y: Labels (shape: [n_samples]).
+    """
+    mu1, mu2 = generate_orthogonal_vectors(p)
+    assert mu1.shape[0] == p and mu2.shape[0] == p, "mu1 and mu2 must have dimension p"
+    assert np.isclose(np.dot(mu1, mu2), 0), "mu1 and mu2 must be orthogonal"
+
+    np.random.seed(seed)
+    
+    # Step 1: Generate clean labels y_tilde ~ Unif{-1, 1}
+    y = np.random.choice([-1, 1], size=n_samples)
+    # Step 2: Generate input data X based on the clean labels
+    X_noisy = np.zeros((n_samples, p))
+    for i in range(n_samples):
+        if y[i] == 1:
+            X_noisy[i] = 0.5 * np.random.multivariate_normal(+mu1, np.eye(p)) + \
+                   0.5 * np.random.multivariate_normal(-mu1, np.eye(p))
+        else:
+            X_noisy[i] = 0.5 * np.random.multivariate_normal(+mu2, np.eye(p)) + \
+                   0.5 * np.random.multivariate_normal(-mu2, np.eye(p))
+    
+    # Step 3: Introduce label noise (flip labels with probability eta)
+    noise = np.random.binomial(1, eta, size=n_samples)  # 1 means flip the label
+    y_noisy = np.where(noise == 1, -y, y)  # Flip labels based on noise
+
+    X_noisy = np.array(X_noisy, dtype=np.float32)
+    y_noisy = np.array(y_noisy, dtype=np.int64)
+
+    # Step 4: generate the true clean distribution
+
+    X_clean = np.zeros((n_samples, p))
+    for i in range(n_samples):
+        if y[i] == 1:
+            X_clean[i] = 0.5 * np.random.multivariate_normal(+mu1, np.eye(p)) + \
+                   0.5 * np.random.multivariate_normal(-mu1, np.eye(p))
+        else:
+            X_clean[i] = 0.5 * np.random.multivariate_normal(+mu2, np.eye(p)) + \
+                   0.5 * np.random.multivariate_normal(-mu2, np.eye(p))
+            
+    X_clean = np.array(X_clean, dtype=np.float32)
+    y_clean = np.array(y, dtype=np.int64)
+    
+    return X_clean, X_noisy, y_clean, y_noisy

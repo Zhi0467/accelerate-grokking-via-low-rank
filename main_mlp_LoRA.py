@@ -152,9 +152,6 @@ for epoch in range(num_epochs):
     -----------------------------------------------------------------------------------------
     a bunch of evaluations and plottings from here on.
     """  
-
-    model.epoch += 1
-
     
     # Compute and log effective ranks of two layers
     layer1_effective_rank = compute_norm_effective_rank(model.effective_weights1)
