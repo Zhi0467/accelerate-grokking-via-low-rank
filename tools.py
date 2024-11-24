@@ -6,6 +6,7 @@ import copy
 import numpy as np
 
 import matplotlib.pyplot as plt
+import matplotlib.cm as cm
 from tqdm import tqdm
 import seaborn as sns
 
@@ -198,6 +199,18 @@ def compute_initial_gradient_quotient(model, criterion, train_loader, device):
     average_gq = total_gq / num_batches if num_batches > 0 else 0.0
     return average_gq
 
+def compute_average_gq_multiple_runs_on_fixed_model(model, criterion, train_loader, device, num_runs=5):
+    total_gq = 0.0
+    model = model.to(device)
+    for _ in range(num_runs):
+        # Compute the average gradient quotient for the current run
+        avg_gq = compute_initial_gradient_quotient(model, criterion, train_loader, device)
+        total_gq += avg_gq
+
+    # Compute the mean gradient quotient across all runs
+    mean_gq = total_gq / num_runs if num_runs > 0 else 0.0
+    return mean_gq
+
 def compute_average_gq_multiple_runs(model_class, criterion, train_loader, device, num_runs=5, **model_kwargs):
     """
     Computes the average gradient quotient over multiple runs.
@@ -285,3 +298,144 @@ def print_model_rank(model):
         if param.requires_grad and len(param.size()) >= 2:
             rank = torch.linalg.matrix_rank(param.data).item()
             print(f"Layer {name}: Rank = {rank}")
+
+
+def request_for_gq(models, filters, names, train_loader, test_loader, criterion, optimizer_class, lr, num_epochs, device, num_gq_runs=5, wd = 0.0):
+    """
+    Train a list of models for a given number of epochs and compute the mean gradient quotient (GQ) after each epoch.
+    
+    Parameters:
+        models (list): List of PyTorch models to be trained.
+        filters (list): List of filters (e.g., "none" or "ema") for each model.
+        train_loader (DataLoader): DataLoader for the training dataset.
+        test_loader (DataLoader): DataLoader for the testing dataset.
+        criterion: Loss function (e.g., nn.CrossEntropyLoss()).
+        optimizer_class: PyTorch optimizer class (e.g., torch.optim.SGD, torch.optim.Adam).
+        lr (float): Learning rate.
+        num_epochs (int): Number of training epochs.
+        device: Device to use ('cuda' or 'cpu').
+        num_gq_runs (int): Number of runs to compute the mean gradient quotient (GQ).
+    
+    Returns:
+        results (dict): Dictionary containing training and test loss/accuracy per epoch for each model and mean GQ per epoch.
+    """
+
+    # Initialize a dictionary to store results for each model
+    results = {
+        'train_loss': [[] for _ in range(len(models))],
+        'test_loss': [[] for _ in range(len(models))],
+        'train_acc': [[] for _ in range(len(models))],
+        'test_acc': [[] for _ in range(len(models))],
+        'mean_gq': [[] for _ in range(len(models))]  # List of mean GQ values per epoch for each model
+    }
+    
+    # Create separate optimizers for each model
+    optimizers = [optimizer_class(model.parameters(), lr=lr, weight_decay = wd) for model in models]
+    
+    # Move each model to the appropriate device
+    for model in models:
+        model.to(device)
+
+    grads = None
+    for epoch in range(num_epochs):
+        for idx, (model, optimizer) in enumerate(zip(models, optimizers)):
+            model.train()  # Set the model to training mode
+            running_loss = 0.0
+            running_correct = 0
+            total_train = 0
+
+            # Training loop
+            for inputs, labels in train_loader:
+                inputs, labels = inputs.to(device), labels.to(device)
+
+                optimizer.zero_grad()
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
+                loss.backward()
+                if filters[idx] == "none":
+                    pass
+                elif filters[idx] == "ema":
+                    grads = gradfilter_ema(model, grads=grads, alpha=0.98, lamb=2.0)
+                else:
+                    raise ValueError(f"Invalid update filter type {filters[idx]}") 
+                optimizer.step()
+
+                running_loss += loss.item() * inputs.size(0)
+                predicted = (outputs >= 0).float() if criterion.__class__.__name__ == "BCELoss" else torch.argmax(outputs, dim=1)
+                running_correct += (predicted == labels).sum().item()
+                total_train += labels.size(0)
+
+            # Calculate average loss and accuracy for training
+            train_loss = running_loss / total_train
+            train_acc = running_correct / total_train
+
+            # Store training results
+            results['train_loss'][idx].append(train_loss)
+            results['train_acc'][idx].append(train_acc)
+
+            # Evaluate on the test set
+            model.eval()  # Set the model to evaluation mode
+            running_loss = 0.0
+            running_correct = 0
+            total_test = 0
+
+            with torch.no_grad():
+                for inputs, labels in test_loader:
+                    inputs, labels = inputs.to(device), labels.to(device)
+                    outputs = model(inputs)
+                    loss = criterion(outputs, labels)
+                    running_loss += loss.item() * inputs.size(0)
+                    predicted = (outputs >= 0).float() if criterion.__class__.__name__ == "BCELoss" else torch.argmax(outputs, dim=1)
+                    running_correct += (predicted == labels).sum().item()
+                    total_test += labels.size(0)
+
+            # Calculate average loss and accuracy for testing
+            test_loss = running_loss / total_test
+            test_acc = running_correct / total_test
+
+            # Store test results
+            results['test_loss'][idx].append(test_loss)
+            results['test_acc'][idx].append(test_acc)
+
+            # Compute mean GQ after each epoch for the current model
+            mean_gq = compute_average_gq_multiple_runs_on_fixed_model(model, criterion, train_loader, device, num_runs=num_gq_runs)
+            results['mean_gq'][idx].append(mean_gq)
+            print(f'Model {idx + 1}, Epoch {epoch + 1}/{num_epochs}, '
+                  f'Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}, '
+                  f'Test Loss: {test_loss:.4f}, Test Acc: {test_acc:.2f}, '
+                  f'Mean GQ: {mean_gq:.4f}')
+    
+    # Plot the results for each model
+    fig, axs = plt.subplots(2, 1, figsize=(12, 18))
+    epochs = range(1, num_epochs + 1)
+
+    # Plot training and testing accuracy
+    for idx in range(len(models)):
+        label = names[idx]  # Ensure label is a string
+        print(label)
+        color = plt.cm.tab10(idx)  # Use color map for different colors
+        # Train and test accuracy subplot
+        axs[0].plot(epochs, results['train_acc'][idx], label=label + ' Train Acc', color=color)
+        axs[0].plot(epochs, results['test_acc'][idx], linestyle='--', label=label + ' Test Acc', color=color)
+    
+    axs[0].set_xlabel('Epoch')
+    axs[0].set_ylabel('Accuracy')
+    axs[0].set_title('Training and Testing Accuracy over Epochs')
+    axs[0].legend()
+    axs[0].grid(True)
+    axs[0].set_xscale('log')
+
+    # Plot mean GQ progression
+    for idx in range(len(models)):
+        label = names[idx]
+        axs[1].plot(epochs, results['mean_gq'][idx], label=label + ' Mean GQ')
+
+    axs[1].set_xlabel('Epoch')
+    axs[1].set_ylabel('Mean Gradient Quotient (GQ)')
+    axs[1].set_title('Mean GQ Progression over Epochs for Each Model')
+    axs[1].legend()
+    axs[1].grid(True)
+    plt.xscale('log')
+    plt.show()
+
+    return results
