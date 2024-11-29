@@ -439,3 +439,255 @@ def request_for_gq(models, filters, names, train_loader, test_loader, criterion,
     plt.show()
 
     return results
+
+def request_for_gq_regression(models, filters, names, train_loader, test_loader, criterion, optimizer_class, lr, num_epochs, device, num_gq_runs=5, wd=0.0):
+    """
+    Train a list of models for a given number of epochs and compute the mean gradient quotient (GQ) after each epoch.
+    Loss is normalized by the initial loss to compare models with different initialization scales.
+    
+    Parameters:
+        models (list): List of PyTorch models to be trained.
+        filters (list): List of filters (e.g., "none" or "ema") for each model.
+        names (list): List of names for each model (for plotting purposes).
+        train_loader (DataLoader): DataLoader for the training dataset.
+        test_loader (DataLoader): DataLoader for the testing dataset.
+        criterion: Loss function (e.g., nn.MSELoss()).
+        optimizer_class: PyTorch optimizer class (e.g., torch.optim.SGD, torch.optim.Adam).
+        lr (float): Learning rate.
+        num_epochs (int): Number of training epochs.
+        device: Device to use ('cuda' or 'cpu').
+        num_gq_runs (int): Number of runs to compute the mean gradient quotient (GQ).
+        wd (float): Weight decay for the optimizer.
+    
+    Returns:
+        results (dict): Dictionary containing training and test loss/accuracy per epoch for each model and mean GQ per epoch.
+    """
+
+    # Initialize a dictionary to store results for each model
+    results = {
+        'train_loss': [[] for _ in range(len(models))],
+        'test_loss': [[] for _ in range(len(models))],
+        'mean_gq': [[] for _ in range(len(models))]  # List of mean GQ values per epoch for each model
+    }
+    
+    # Create separate optimizers for each model
+    optimizers = [optimizer_class(model.parameters(), lr=lr, weight_decay=wd) for model in models]
+    
+    # Move each model to the appropriate device
+    for model in models:
+        model.to(device)
+    
+    # Compute initial losses for normalization
+    initial_losses = []
+    for model in models:
+        model.eval()  # Set the model to evaluation mode
+        total_initial_loss = 0.0
+        total_samples = 0
+        with torch.no_grad():
+            for inputs, labels in train_loader:
+                inputs, labels = inputs.to(device), labels.to(device)
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
+                total_initial_loss += loss.item() * inputs.size(0)
+                total_samples += inputs.size(0)
+        
+        initial_loss = total_initial_loss / total_samples if total_samples > 0 else 1.0
+        initial_losses.append(initial_loss)
+
+    grads = None
+    for epoch in range(num_epochs):
+        for idx, (model, optimizer) in enumerate(zip(models, optimizers)):
+            model.train()  # Set the model to training mode
+            running_loss = 0.0
+            total_train = 0
+
+            # Training loop
+            for inputs, labels in train_loader:
+                inputs, labels = inputs.to(device), labels.to(device)
+
+                optimizer.zero_grad()
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
+                loss.backward()
+                
+                # Apply gradient filtering if necessary
+                if filters[idx] == "none":
+                    pass
+                elif filters[idx] == "ema":
+                    grads = gradfilter_ema(model, grads=grads, alpha=0.98, lamb=2.0)
+                else:
+                    raise ValueError(f"Invalid update filter type {filters[idx]}") 
+                
+                optimizer.step()
+
+                running_loss += loss.item() * inputs.size(0)
+                total_train += labels.size(0)
+
+            # Calculate average loss and normalized accuracy for training
+            train_loss = running_loss / total_train
+            train_loss_normalized = train_loss / initial_losses[idx] if initial_losses[idx] != 0 else train_loss
+
+            # Store training results
+            results['train_loss'][idx].append(train_loss_normalized)
+
+            # Evaluate on the test set
+            model.eval()  # Set the model to evaluation mode
+            running_loss = 0.0
+            running_correct = 0
+            total_test = 0
+
+            with torch.no_grad():
+                for inputs, labels in test_loader:
+                    inputs, labels = inputs.to(device), labels.to(device)
+                    outputs = model(inputs)
+                    loss = criterion(outputs, labels)
+                    running_loss += loss.item() * inputs.size(0)
+                    total_test += labels.size(0)
+
+            # Calculate average loss and accuracy for testing
+            test_loss = running_loss / total_test
+            test_loss_normalized = test_loss / initial_losses[idx] if initial_losses[idx] != 0 else test_loss
+
+            # Store test results
+            results['test_loss'][idx].append(test_loss_normalized)
+
+            # Compute mean GQ after each epoch for the current model
+            mean_gq = compute_average_gq_multiple_runs_on_fixed_model(model, criterion, train_loader, device, num_runs=num_gq_runs)
+            results['mean_gq'][idx].append(mean_gq)
+            print(f'Model {idx + 1}, Epoch {epoch + 1}/{num_epochs}, '
+                  f'Train Loss (Norm): {train_loss_normalized:.4f}, '
+                  f'Test Loss (Norm): {test_loss_normalized:.4f}, '
+                  f'Mean GQ: {mean_gq:.4f}')
+    
+    # Plot the results for each model
+    fig, axs = plt.subplots(2, 1, figsize=(12, 18))
+    epochs = range(1, num_epochs + 1)
+
+    # Plot training and testing accuracy
+    for idx in range(len(models)):
+        label = names[idx]  # Ensure label is a string
+        color = plt.cm.tab10(idx)  # Use color map for different colors
+        # Train and test accuracy subplot
+        axs[0].plot(epochs, results['train_loss'][idx], label=label + ' Train Loss', color=color)
+        axs[0].plot(epochs, results['test_loss'][idx], linestyle='--', label=label + ' Test Loss', color=color)
+    
+    axs[0].set_xlabel('Epoch')
+    axs[0].set_ylabel('Normalized Loss (by initial loss)')
+    axs[0].set_title('Normalized Loss over Epochs')
+    axs[0].legend()
+    axs[0].grid(True)
+    axs[0].set_xscale('log')
+
+    # Plot mean GQ progression
+    for idx in range(len(models)):
+        label = names[idx]
+        axs[1].plot(epochs, results['mean_gq'][idx], label=label + ' Mean GQ')
+
+    axs[1].set_xlabel('Epoch')
+    axs[1].set_ylabel('Mean Gradient Quotient (GQ)')
+    axs[1].set_title('Mean GQ Progression over Epochs for Each Model')
+    axs[1].legend()
+    axs[1].grid(True)
+    plt.xscale('log')
+    plt.show()
+
+    return results
+
+def generate_gaussian_regression_data(num_samples, input_dim, noise_std=0.1):
+    """
+    Generate synthetic Gaussian data for regression with a known ground truth.
+    
+    Parameters:
+        num_samples (int): Number of samples to generate.
+        input_dim (int): Dimensionality of the input data.
+        noise_std (float): Standard deviation of the noise added to the outputs.
+    
+    Returns:
+        X (torch.Tensor): Input features of shape (num_samples, input_dim).
+        y (torch.Tensor): Targets of shape (num_samples, 1).
+        true_weights (torch.Tensor): Ground truth weight vector.
+    """
+    # Random Gaussian input data
+    X = torch.randn(num_samples, input_dim)
+    
+    # Ground truth weights
+    true_weights = torch.randn(input_dim, 1)
+    
+    # Generate targets with Gaussian noise
+    y = X @ true_weights + noise_std * torch.randn(num_samples, 1)
+    
+    return X, y, true_weights
+
+def generate_polynomial_regression_data(num_samples, input_dim, noise_std=0.1, degree=3):
+    """
+    Generate synthetic polynomial regression data with a known polynomial ground truth function.
+    
+    Parameters:
+        num_samples (int): Number of samples to generate.
+        input_dim (int): Dimensionality of the input data.
+        noise_std (float): Standard deviation of the noise added to the outputs.
+        degree (int): Degree of the polynomial used in the ground truth function.
+    
+    Returns:
+        X (torch.Tensor): Input features of shape (num_samples, input_dim).
+        y (torch.Tensor): Targets of shape (num_samples, 1).
+        true_coeffs (list): List of coefficients used in the polynomial ground truth function.
+    """
+    # Random input data
+    X = torch.randn(num_samples, input_dim)
+    
+    # Generate polynomial ground truth function coefficients (random for each degree)
+    true_coeffs = [torch.randn(1) for _ in range(degree + 1)]  # Coefficients for terms up to degree
+    y_true = torch.zeros(num_samples, 1)
+    
+    # Compute polynomial function: y = c0 + c1*x + c2*x^2 + ... + c_degree*x^degree
+    for d in range(degree + 1):
+        y_true += true_coeffs[d] * (X ** (d + 1)).sum(dim=1, keepdim=True)
+
+    # Add noise to the target
+    y = y_true + noise_std * torch.randn(num_samples, 1)
+    
+    return X, y, true_coeffs
+
+def generate_nn_regression_data(num_samples, input_dim, noise_std=0.1, hidden_dim=2):
+    """
+    Generate synthetic regression data using a small randomly initialized neural network.
+    
+    Parameters:
+        num_samples (int): Number of samples to generate.
+        input_dim (int): Dimensionality of the input data.
+        noise_std (float): Standard deviation of the noise added to the outputs.
+        hidden_dim (int): Number of neurons in the hidden layer.
+    
+    Returns:
+        X (torch.Tensor): Input features of shape (num_samples, input_dim).
+        y (torch.Tensor): Targets of shape (num_samples, 1).
+        model (nn.Module): The randomly initialized neural network used to generate the data.
+    """
+    # Define a small neural network with a single hidden layer
+    class SmallNN(nn.Module):
+        def __init__(self, input_dim, hidden_dim):
+            super(SmallNN, self).__init__()
+            self.hidden_layer = nn.Linear(input_dim, hidden_dim)
+            self.output_layer = nn.Linear(hidden_dim, 1)
+            self.activation = nn.ReLU()  # Non-linear activation function
+
+        def forward(self, x):
+            x = self.activation(self.hidden_layer(x))
+            return self.output_layer(x)
+
+    # Instantiate the model and freeze its parameters (to use it as a generator)
+    model = SmallNN(input_dim, hidden_dim)
+    model.eval()  # Set the model to evaluation mode
+    
+    # Generate random input data
+    X = torch.randn(num_samples, input_dim)
+    
+    # Generate output using the network
+    with torch.no_grad():
+        y_true = model(X)
+    
+    # Add noise to the output
+    y = y_true + noise_std * torch.randn_like(y_true)
+    
+    return X, y, model

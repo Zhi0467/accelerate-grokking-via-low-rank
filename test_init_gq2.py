@@ -43,9 +43,9 @@ hidden_dim = 2048
 scale = 16.0
 alpha = 0.3
 batch_size = 128
-lr = 1e-8
+lr = 1e-3
 output_dim = 1
-X, y, true_weights = generate_nn_regression_data(num_samples=num_samples, input_dim=input_dim)
+X, y, true_weights = generate_polynomial_regression_data(num_samples=num_samples, input_dim=input_dim, degree=10)
 dataset = TensorDataset(X, y)
 train_size = int(alpha * len(dataset))
 test_size = len(dataset) - train_size
@@ -126,7 +126,7 @@ models = [model1, model2, model3, model4]
 labels = ['baseline', 'rank 1', "metainit", "small-init"]
 filters = ['none', 'none', 'none', "none"]
 
-metainit_with_dataset(model3, criterion, train_loader, device, lr=0.1, momentum=0.9, steps=1000, eps=1e-5)
+metainit_with_dataset(model3, criterion, train_loader, device, lr=0.1, momentum=0.9, steps=2000, eps=1e-5)
 
 # this function plots the GQ progression of the models with corresponding filters
 if criterion.__class__.__name__ == "MSELoss":
@@ -137,12 +137,12 @@ if criterion.__class__.__name__ == "MSELoss":
         train_loader=train_loader,
         test_loader=test_loader,
         criterion=criterion,
-        optimizer_class=torch.optim.SGD,  # Change optimizer if needed
+        optimizer_class=torch.optim.AdamW,  # Change optimizer if needed
         lr=lr,
-        num_epochs=2000,
+        num_epochs=10000,
         device=device,
         num_gq_runs= 10, # Number of runs for mean GQ computation
-        wd = 0.0
+        wd = 0.1
     )
 else:
     request_for_gq(
